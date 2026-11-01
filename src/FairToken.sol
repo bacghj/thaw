@@ -230,6 +230,8 @@ contract FairToken {
     /// @notice Vest tokens already copied into some account's `claimable`. Always <= `vestedOut`.
     ///         The gap `vestedOut - vestAssigned` is unallocated dust and stays in the pool's favour.
     uint256 public vestAssigned;
+    /// @notice Lifetime vest wei copied into each account. Never reduced when a forfeit rebases `vestDebt`.
+    mapping(address => uint256) public vestGrantedOf;
     uint256 public burnedLocked;
     uint256 public earmark;
     uint256 public initialPool;
@@ -850,6 +852,8 @@ contract FairToken {
                 a.claimable += gain;
                 vestAssigned += gain;
                 a.vestDebt += gain;
+                // Historical grant. A later rebase of `vestDebt` must not add this again.
+                vestGrantedOf[user] += gain;
             }
         }
         uint256 fAcc = a.points * accForfeit / PREC;
@@ -919,8 +923,8 @@ contract FairToken {
         if (amt == 0 || locked == 0 || a.points == 0 || totalPoints == 0) return 0;
         if (amt > locked) amt = locked;
         if (amt == 0) return 0;
-        // Claim rights already copied into `claimable` must stay in `vestDebt`.
-        // Resetting the debt to the post-forfeit index pays that same vest again.
+        // Copy the current index into `claimable` first. Those tokens stay with the holder.
+        // `vestGrantedOf` is the historical total and is not reduced below.
         _crystallize(user);
         uint256 pointsRemove = amt == locked ? a.points : a.points * amt / locked;
         if (pointsRemove == 0) return 0;
@@ -929,6 +933,11 @@ contract FairToken {
         pool -= amt;
         a.forfeitedOut += amt;
         earmark += amt;
+        // Re-base both debts onto the surviving points. The debt drop is the removed
+        // points' settled credit; it is not a new claim. Keeping the pre-forfeit debt
+        // subtracts that credit a second time from every later release.
+        a.vestDebt = a.points * accVest / PREC;
+        a.forfeitDebt = a.points * accForfeit / PREC;
         parked = amt;
     }
 

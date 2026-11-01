@@ -8,13 +8,20 @@ import {StdUtils} from "forge-std/StdUtils.sol";
 import {FairToken} from "../src/FairToken.sol";
 import {MockAgentIdVerifier} from "./mocks/MockAgentIdVerifier.sol";
 import {MiniFactory, MiniPair, MiniRouter, MiniWBNB} from "./mocks/MiniAmm.sol";
+import {EntitlementOracle} from "./EntitlementOracle.sol";
 
 contract SmallVestHandler is CommonBase, StdCheats, StdUtils {
     FairToken public token;
     MiniRouter public router;
     MiniWBNB public wbnb;
+    EntitlementOracle public oracle;
     address[] public actors;
     address public sink;
+
+    modifier tracked() {
+        _;
+        oracle.sync();
+    }
 
     constructor(FairToken token_, MiniRouter router_, MiniWBNB wbnb_, address[] memory actors_) {
         token = token_;
@@ -22,29 +29,38 @@ contract SmallVestHandler is CommonBase, StdCheats, StdUtils {
         wbnb = wbnb_;
         sink = address(0x5151);
         for (uint256 i; i < actors_.length; ++i) actors.push(actors_[i]);
+        oracle = new EntitlementOracle(token_, actors_);
     }
 
     function actorLength() external view returns (uint256) {
         return actors.length;
     }
 
-    function poke() external {
+    function poke() external tracked {
         token.poke();
     }
 
-    function claim(uint256 i) external {
+    function claim(uint256 i) external tracked {
         address a = actors[i % actors.length];
         vm.prank(a);
         token.claim();
     }
 
-    function warp(uint256 dt) external {
+    function warp(uint256 dt) external tracked {
         dt = bound(dt, 1 hours, 2 days);
         vm.warp(block.timestamp + dt);
         vm.roll(block.number + 1);
+        if (block.timestamp >= token.openTime() + token.forfeitWindow()) token.poke();
     }
 
-    function tinyBuy(uint256 amountOut) external {
+    function closeVest() external tracked {
+        uint256 end = token.openTime() + token.forfeitWindow();
+        if (block.timestamp < end) vm.warp(end);
+        vm.roll(block.number + 1);
+        token.poke();
+    }
+
+    function tinyBuy(uint256 amountOut) external tracked {
         amountOut = bound(amountOut, 1, 40);
         address pair = token.pair();
         MiniPair p = MiniPair(pair);
@@ -58,7 +74,7 @@ contract SmallVestHandler is CommonBase, StdCheats, StdUtils {
     }
 
     /// @dev Transfer claimed tokens to a non-minter. Inside the forfeit window this parks locked tokens.
-    function transferToOutsider(uint256 i, uint256 pct) external {
+    function transferToOutsider(uint256 i, uint256 pct) external tracked {
         address a = actors[i % actors.length];
         uint256 bal = token.balanceOf(a);
         if (bal == 0) return;
@@ -70,7 +86,7 @@ contract SmallVestHandler is CommonBase, StdCheats, StdUtils {
         token.transfer(sink, amt);
     }
 
-    function sell(uint256 i, uint256 pct) external {
+    function sell(uint256 i, uint256 pct) external tracked {
         address a = actors[i % actors.length];
         uint256 bal = token.balanceOf(a);
         if (bal < 2) return;
@@ -130,53 +146,33 @@ contract FairSmallVestInvariantTest is Test {
         p.minUnit = 1;
         token = new FairToken(p);
 
-        address[] memory actors = new address[](4);
-        for (uint256 i; i < 4; ++i) {
+        address[] memory actors = new address[](8);
+        for (uint256 i; i < actors.length; ++i) {
             actors[i] = makeAddr(string(abi.encodePacked("small", i)));
             ver.set(actors[i], bytes32(i + 1));
             vm.deal(actors[i], 1 ether);
-            (uint256 cost,) = token.quote(2);
+            (uint256 cost,) = token.quote(1);
             vm.prank(actors[i]);
-            token.mint{value: cost}(2);
+            token.mint{value: cost}(1);
         }
         token.finalize();
 
         handler = new SmallVestHandler(token, router, wbnb, actors);
         vm.deal(address(handler), 100 ether);
         targetContract(address(handler));
-        bytes4[] memory selectors = new bytes4[](6);
+        bytes4[] memory selectors = new bytes4[](7);
         selectors[0] = handler.poke.selector;
         selectors[1] = handler.claim.selector;
         selectors[2] = handler.tinyBuy.selector;
         selectors[3] = handler.transferToOutsider.selector;
         selectors[4] = handler.sell.selector;
         selectors[5] = handler.warp.selector;
+        selectors[6] = handler.closeVest.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
 
     function invariant_vestClaimsWithinReleased() public view {
-        uint256 sum;
-        uint256 n = handler.actorLength();
-        for (uint256 i; i < n; ++i) {
-            address a = handler.actors(i);
-            (uint256 shares,, uint256 points,,,,,,,,, bool materialized) = token.accounts(a);
-            uint256 pts = materialized ? points : shares * token.lockedPerShare();
-            sum += pts * token.accVest() / 1e18;
-        }
-        assertLe(sum, token.vestedOut());
-        uint256 payout;
-        uint256 entitlement;
-        for (uint256 i; i < n; ++i) {
-            address a = handler.actors(i);
-            (uint256 shares,,, uint256 vestDebt,, uint256 claimable,,, uint256 claimed,,,) = token.accounts(a);
-            payout += claimed + claimable;
-            entitlement += shares * token.immediatePerShare();
-            // `claimed` is only immediate unlock plus vest copied into claimable.
-            // Forfeited lock is not an extra payout, and market buys are not in `claimed`.
-            assertLe(claimed, shares * token.immediatePerShare() + vestDebt);
-        }
-        assertLe(payout, entitlement + token.vestedOut());
-        assertLe(token.vestAssigned(), token.vestedOut());
+        handler.oracle().check();
         assertGe(
             token.balanceOf(address(token)),
             token.pool() + token.earmark() + token.taxDevReserve() + token.taxLpReserve()

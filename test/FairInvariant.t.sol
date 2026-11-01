@@ -50,20 +50,20 @@ contract FairInvariantTest is Test {
         p.minUnit = 1e12;
         token = new FairToken(p);
 
-        address[] memory actors = new address[](4);
-        for (uint256 i; i < 4; ++i) {
+        address[] memory actors = new address[](8);
+        for (uint256 i; i < actors.length; ++i) {
             actors[i] = makeAddr(string(abi.encodePacked("inv", i)));
             ver.set(actors[i], bytes32(uint256(i + 1)));
             vm.deal(actors[i], 500 ether);
-            (uint256 cost,) = token.quote(4);
+            (uint256 cost,) = token.quote(2);
             vm.prank(actors[i]);
-            token.mint{value: cost}(4);
+            token.mint{value: cost}(2);
         }
         token.finalize();
 
         handler = new FairHandler(token, router, wbnb, actors);
         targetContract(address(handler));
-        bytes4[] memory selectors = new bytes4[](8);
+        bytes4[] memory selectors = new bytes4[](9);
         selectors[0] = handler.claim.selector;
         selectors[1] = handler.poke.selector;
         selectors[2] = handler.warp.selector;
@@ -72,6 +72,7 @@ contract FairInvariantTest is Test {
         selectors[5] = handler.sell.selector;
         selectors[6] = handler.skimPairToSelf.selector;
         selectors[7] = handler.syncPair.selector;
+        selectors[8] = handler.closeVest.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
 
@@ -94,6 +95,11 @@ contract FairInvariantTest is Test {
     function invariant_raisedNotHeldByToken() public view {
         assertEq(address(token).balance, 0);
         assertGt(wbnb.balanceOf(token.pair()), 0);
+    }
+
+    /// @notice Each holder is paid their own vest, both directions, including after forfeits.
+    function invariant_entitlement() public view {
+        handler.oracle().check();
     }
 
     function invariant_forfeitCurve() public view {

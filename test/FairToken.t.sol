@@ -7,6 +7,7 @@ import {AgentIdVerifier, IHandleRegistry} from "../src/verifiers/AgentIdVerifier
 import {MockAgentIdVerifier} from "./mocks/MockAgentIdVerifier.sol";
 import {MiniFactory, MiniPair, MiniRouter, MiniWBNB} from "./mocks/MiniAmm.sol";
 import {Deploy} from "../script/Deploy.s.sol";
+import {EntitlementOracle} from "./EntitlementOracle.sol";
 
 contract ContractMinter {
     function go(FairToken t, uint256 shares) external payable {
@@ -884,6 +885,75 @@ contract FairTokenTest is Test {
         assertFalse(pulled);
     }
 
+    /// @notice Default-size supply. After a partial vest, A moves the whole liquid balance.
+    ///         The forfeit should come only out of what is still locked. Day 14 must still
+    ///         pay the locked remainder. Keeping the pre-forfeit debt drops that remainder
+    ///         by the forfeit amount a second time.
+    function test_defaultForfeitDoesNotEraseLaterVest() public {
+        FairToken.Params memory p = _params();
+        p.hardCap = 30_000;
+        p.softCap = 1_000;
+        p.maxPerWallet = 5;
+        p.maxPerIdentity = 5;
+        p.tokensPerShare = 3000 ether;
+        p.minUnit = 1;
+        p.swapThreshold = 1_000_000 ether;
+        FairToken t = _fresh(p);
+
+        address[] memory holders = new address[](200);
+        holders[0] = _actor(bytes32("forfeit-A"));
+        address a = holders[0];
+        _mint(t, a, 5);
+        for (uint256 i = 1; i < 200; ++i) {
+            holders[i] = _actor(bytes32(i));
+            _mint(t, holders[i], 5);
+        }
+        vm.warp(t.deadline() + 1);
+        t.finalize();
+        EntitlementOracle oracle = new EntitlementOracle(t, holders);
+
+        vm.warp(t.openTime() + 10.5 days);
+        t.poke();
+        oracle.sync();
+        oracle.check();
+        vm.prank(a);
+        t.claim();
+        uint256 liquid = t.balanceOf(a);
+        (uint256 lockedBefore,,,) = t.unlockState(a);
+        assertGt(liquid, 0);
+        assertGt(lockedBefore, 0);
+
+        vm.prank(a);
+        t.transfer(makeAddr("sink"), liquid);
+        oracle.sync();
+        oracle.check();
+        (,,,,,,,,, uint256 forfeitedOut,,) = t.accounts(a);
+        assertGt(forfeitedOut, 0);
+        assertLt(forfeitedOut, lockedBefore);
+
+        uint256 rate = t.forfeitRateAt(t.openTime() + 10.5 days);
+        assertApproxEqAbs(forfeitedOut, lockedBefore * rate / PREC, 2, "legitimate forfeit");
+
+        vm.warp(t.openTime() + 14 days);
+        t.poke();
+        oracle.sync();
+        oracle.check();
+        vm.prank(a);
+        t.claim();
+        oracle.sync();
+        oracle.check();
+        uint256 second = t.balanceOf(a);
+        uint256 remaining = lockedBefore - forfeitedOut;
+        // Remainder of the locked balance after the single forfeit, plus at most A's
+        // share of the redistribution. Not that remainder minus the forfeit again.
+        assertGe(second + 1000, remaining, "later vest missing the forfeited amount");
+        assertLt(second, lockedBefore, "forfeited lock paid back in full");
+        (,,,,,,, uint256 received,,,,) = t.accounts(a);
+        if (second > remaining) {
+            assertLe(second - remaining, received + 1000, "extra claim exceeds redistribution");
+        }
+    }
+
     /// @notice Buy 10, A transfers 12_006 inside the full-forfeit window, buy 2.
     ///         Released total is 3; the debt reset lets A and B claim 4.
     function test_forfeitBetweenDustReleasesCannotOverclaim() public {
@@ -901,25 +971,39 @@ contract FairTokenTest is Test {
         _mint(t, a, 4);
         _mint(t, b, 4);
         t.finalize();
+        address[] memory holders = new address[](2);
+        holders[0] = a;
+        holders[1] = b;
+        EntitlementOracle oracle = new EntitlementOracle(t, holders);
         vm.prank(a);
         t.claim();
         vm.prank(b);
         t.claim();
+        oracle.sync();
+        oracle.check();
 
         _swapOut(t, 10);
         _roll();
         t.poke();
+        oracle.sync();
+        oracle.check();
         uint256 amt = 12_006;
         vm.prank(a);
         t.transfer(makeAddr("outsider"), amt);
+        oracle.sync();
+        oracle.check();
         _swapOut(t, 2);
         _roll();
         t.poke();
+        oracle.sync();
+        oracle.check();
 
         vm.prank(a);
         try t.claim() {} catch {}
         vm.prank(b);
         try t.claim() {} catch {}
+        oracle.sync();
+        oracle.check();
 
         uint256 immediate = 4 * t.immediatePerShare() * 2;
         uint256 vestPaid = t.claimedTotal() - immediate;
