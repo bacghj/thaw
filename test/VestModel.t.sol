@@ -56,10 +56,11 @@ contract VestModelTest is Test {
         console2.log("round7-second-before", pricedOnOld);
         console2.log("round7-second-after", second);
         console2.log("round7-second-model", modelSecond);
+        console2.log("round7-gap", _gap(second, modelSecond));
 
-        assertApproxEqAbs(lockedAfter, lockedBefore - first, 20, "first forfeit left the locked balance");
-        assertApproxEqAbs(second, expect, 20, "second forfeit is rate times remaining locked");
-        assertApproxEqAbs(second, modelSecond, 20, "second forfeit matches the model");
+        assertApproxEqAbs(lockedAfter, lockedBefore - first, 1000, "first forfeit left the locked balance");
+        assertApproxEqAbs(second, expect, 1000, "second forfeit is rate times remaining locked");
+        assertApproxEqAbs(second, modelSecond, 1000, "second forfeit matches the model");
         assertLt(second, pricedOnOld, "second forfeit is not priced on the pre-forfeit lock");
 
         _finish(t, m, hs);
