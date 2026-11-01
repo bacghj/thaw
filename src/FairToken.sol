@@ -741,18 +741,38 @@ contract FairToken {
         if (target <= vestedOut) return;
         uint256 delta = target - vestedOut;
         if (delta > pool) delta = pool;
-        uint256 per = delta * PREC / totalPoints;
-        // `per * totalPoints / PREC` can be 0 even when `per` is not, once `totalPoints < 1e18`.
-        // Adding `per` anyway lets claims accumulate while `vestedOut` stays put.
-        uint256 credited = per == 0 ? 0 : per * totalPoints / PREC;
-        if (credited == 0) {
+        (uint256 newAcc, uint256 pay) = _bookRelease(accVest, pool, totalPoints, delta);
+        if (pay == 0) {
             if (_fraction(hwmNet) == PREC) _burnPoolDust();
             return;
         }
-        accVest += per;
-        pool -= credited;
-        vestedOut += credited;
+        accVest = newAcc;
+        pool -= pay;
+        vestedOut += pay;
         if (pool > 0 && _fraction(hwmNet) == PREC) _burnPoolDust();
+    }
+
+    /// @dev Move the index by the tokens that actually leave `pool`, not by the sum of
+    ///      per-round quotients. `totalPoints * accVest / PREC` then stays <= `vestedOut`,
+    ///      including after several dust-sized rounds.
+    function _bookRelease(uint256 acc, uint256 poolBal, uint256 points, uint256 delta)
+        private
+        pure
+        returns (uint256 newAcc, uint256 pay)
+    {
+        if (points == 0 || poolBal == 0 || delta == 0) return (acc, 0);
+        if (delta > poolBal) delta = poolBal;
+        uint256 per = delta * PREC / points;
+        uint256 credited = per == 0 ? 0 : per * points / PREC;
+        if (credited == 0) return (acc, 0);
+        uint256 already = acc * points / PREC;
+        uint256 accTry = (already + credited) * PREC / points;
+        if (accTry <= acc) return (acc, 0);
+        uint256 assignable = accTry * points / PREC;
+        if (assignable <= already) return (acc, 0);
+        pay = assignable - already;
+        if (pay > poolBal) return (acc, 0);
+        newAcc = accTry;
     }
 
     function _burnPoolDust() internal {
@@ -798,11 +818,10 @@ contract FairToken {
         if (target <= vestedOut) return (acc, poolAfter);
         uint256 delta = target - vestedOut;
         if (delta > poolAfter) delta = poolAfter;
-        uint256 per = delta * PREC / totalPoints;
-        uint256 credited = per == 0 ? 0 : per * totalPoints / PREC;
-        if (credited == 0) return (acc, poolAfter);
-        acc += per;
-        poolAfter -= credited;
+        (uint256 newAcc, uint256 pay) = _bookRelease(acc, poolAfter, totalPoints, delta);
+        if (pay == 0) return (acc, poolAfter);
+        acc = newAcc;
+        poolAfter -= pay;
     }
 
     function _ensurePoints(address user) internal {

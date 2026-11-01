@@ -884,6 +884,38 @@ contract FairTokenTest is Test {
         assertFalse(pulled);
     }
 
+    /// @notice Reviewer counterexample: buy 6 wei, poke, buy 2 wei, poke.
+    ///         The old index releases 2 and lets the sole holder claim 3.
+    function test_twoRoundDustBuysCannotOverclaim() public {
+        FairToken.Params memory p = _params();
+        p.hardCap = 8;
+        p.softCap = 4;
+        p.maxPerWallet = 8;
+        p.maxPerIdentity = 8;
+        p.tokensPerShare = 30_000;
+        p.swapThreshold = 1_000_000 ether;
+        FairToken t = _fresh(p);
+        address a = _actor(bytes32("two-round"));
+        _fillAndFinalize(t, a);
+        vm.prank(a);
+        t.claim();
+        uint256 held = t.balanceOf(a);
+
+        _swapOut(t, 6);
+        _roll();
+        t.poke();
+        _swapOut(t, 2);
+        _roll();
+        t.poke();
+
+        vm.prank(a);
+        try t.claim() {} catch {}
+        uint256 vestClaimed = t.balanceOf(a) - held;
+        assertLe(vestClaimed, t.vestedOut(), "claims within released");
+        assertEq(t.pool() + t.vestedOut() + t.burnedLocked() + t.earmark(), t.initialPool());
+        assertGe(t.balanceOf(address(t)), t.pool() + t.earmark());
+    }
+
     function test_smallSupplyVestCannotClaimUnreleased() public {
         FairToken.Params memory p = _params();
         p.hardCap = 8;
@@ -936,6 +968,43 @@ contract FairTokenTest is Test {
         vm.prank(a);
         t.claim();
         assertEq(t.balanceOf(a) - held, t.vestedOut());
+    }
+
+    function testFuzz_manyTinyRoundsConserveVest(uint256 rounds, uint256 salt) public {
+        rounds = bound(rounds, 2, 16);
+        FairToken.Params memory p = _params();
+        p.hardCap = 8;
+        p.softCap = 4;
+        p.maxPerWallet = 2;
+        p.maxPerIdentity = 2;
+        p.tokensPerShare = 30_000;
+        p.swapThreshold = 1_000_000 ether;
+        FairToken t = _fresh(p);
+        address[] memory holders = new address[](4);
+        for (uint256 i; i < 4; ++i) {
+            holders[i] = _actor(bytes32(i + 1));
+            _mint(t, holders[i], 2);
+        }
+        t.finalize();
+        for (uint256 r; r < rounds; ++r) {
+            uint256 amt = (uint256(keccak256(abi.encode(salt, r))) % 30) + 1;
+            _swapOut(t, amt);
+            _roll();
+            t.poke();
+            _assertVestConserved(t, holders);
+        }
+    }
+
+    function _assertVestConserved(FairToken t, address[] memory holders) internal view {
+        uint256 sum;
+        for (uint256 i; i < holders.length; ++i) {
+            (uint256 shares,, uint256 points,,,,,,,,, bool materialized) = t.accounts(holders[i]);
+            uint256 pts = materialized ? points : shares * t.lockedPerShare();
+            sum += pts * t.accVest() / PREC;
+        }
+        assertLe(sum, t.vestedOut());
+        assertGe(t.balanceOf(address(t)), t.pool() + t.earmark() + t.taxDevReserve() + t.taxLpReserve());
+        assertEq(t.pool() + t.vestedOut() + t.burnedLocked() + t.earmark(), t.initialPool());
     }
 
     function testFuzz_releaseNeverPaysMoreThanVested(uint256 amountOut) public {

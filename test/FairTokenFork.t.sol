@@ -164,6 +164,55 @@ contract FairTokenForkTest is Test {
         assertEq(t.pool() + t.vestedOut() + t.burnedLocked() + t.earmark(), t.initialPool());
     }
 
+    /// @notice Real router, pair pre-seeded with extra WBNB so addLiquidityETH uses only part of the tokens.
+    function test_fork_skewedPairPartialAutoLp() public {
+        MockAgentIdVerifier ver = new MockAgentIdVerifier();
+        address dev = makeAddr("dev");
+        FairToken t = new FairToken(_params(address(ver), dev));
+        address pair = _createOrGet(address(t));
+
+        address a = makeAddr("minter");
+        ver.set(a, bytes32("skew"));
+        vm.deal(a, 10 ether);
+        uint256 cap = t.hardCap();
+        (uint256 cost,) = t.quote(cap);
+        vm.prank(a);
+        t.mint{value: cost}(cap);
+        t.finalize();
+        assertEq(t.pair(), pair);
+        assertEq(address(t).balance, 0, "pool open");
+        assertGt(IPancakePair(pair).balanceOf(t.DEAD()), 0, "LP burned");
+
+        vm.deal(address(this), 40 ether);
+        IWBNB(WBNB).deposit{value: 30 ether}();
+        require(IWBNB(WBNB).transfer(pair, 30 ether), "skew");
+        IPancakePair(pair).sync();
+
+        vm.prank(a);
+        t.claim();
+        uint256 sellAmt = t.balanceOf(a) / 10;
+        address[] memory back = new address[](2);
+        back[0] = address(t);
+        back[1] = WBNB;
+        vm.startPrank(a);
+        t.approve(ROUTER, type(uint256).max);
+        IPancakeRouter(ROUTER).swapExactTokensForETHSupportingFeeOnTransferTokens(sellAmt, 0, back, a, block.timestamp);
+        IPancakeRouter(ROUTER).swapExactTokensForETHSupportingFeeOnTransferTokens(sellAmt, 0, back, a, block.timestamp);
+        vm.stopPrank();
+
+        uint256 feeLp = sellAmt * 150 / 10_000;
+        uint256 reserved = t.taxLpReserve();
+        assertGt(reserved, feeLp, "real router left unused tokens in the reserve");
+        assertGt(dev.balance, 0, "dev tax paid");
+
+        vm.prank(a);
+        IPancakeRouter(ROUTER).swapExactTokensForETHSupportingFeeOnTransferTokens(sellAmt, 0, back, a, block.timestamp);
+        assertLt(t.taxLpReserve(), reserved + feeLp, "leftover tokens reused");
+        vm.prank(dev);
+        (bool pulled,) = address(t).call(abi.encodeWithSignature("withdraw()"));
+        assertFalse(pulled);
+    }
+
     function _createOrGet(address token) internal returns (address pair) {
         (bool ok, bytes memory data) =
             FACTORY.call(abi.encodeWithSignature("getPair(address,address)", token, WBNB));
