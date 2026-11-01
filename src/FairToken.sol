@@ -232,6 +232,9 @@ contract FairToken {
     uint256 public vestAssigned;
     /// @notice Lifetime vest wei copied into each account. Never reduced when a forfeit rebases `vestDebt`.
     mapping(address => uint256) public vestGrantedOf;
+    /// @notice Token wei this holder still owes from forfeits that did not move points.
+    ///         Independent of `vestDebt`, so a later point rebase cannot erase it.
+    mapping(address => uint256) public forfeitChargeOf;
     uint256 public burnedLocked;
     uint256 public earmark;
     uint256 public initialPool;
@@ -387,6 +390,9 @@ contract FairToken {
         if (pts > 0) {
             uint256 got = pts * acc / PREC;
             if (got > a.vestDebt) pending = got - a.vestDebt;
+            uint256 charge = forfeitChargeOf[account];
+            if (pending > charge) pending -= charge;
+            else pending = 0;
             uint256 room = vestedOut > vestAssigned ? vestedOut - vestAssigned : 0;
             if (pending > room) pending = room;
         }
@@ -535,6 +541,7 @@ contract FairToken {
         _checkpoint();
         _ensurePoints(msg.sender);
         _crystallize(msg.sender);
+        if (block.timestamp >= openTime + forfeitWindow) _burnUnindexedVest();
         Account storage a = accounts[msg.sender];
         uint256 amt = a.claimable;
         if (amt == 0) revert NothingToClaim();
@@ -739,24 +746,50 @@ contract FairToken {
             _flushEarmark(true, address(0));
         }
         _releaseLocked();
+        if (block.timestamp >= openTime + forfeitWindow) _burnUnindexedVest();
     }
 
     function _releaseLocked() internal {
-        if (pool == 0 || totalPoints == 0) return;
+        if (pool == 0 || totalPoints == 0) {
+            if (_fraction(hwmNet) == PREC) _burnUnindexedVest();
+            return;
+        }
         uint256 base = initialPool - burnedLocked;
         uint256 target = base * _fraction(hwmNet) / PREC;
-        if (target <= vestedOut) return;
+        if (target <= vestedOut) {
+            if (_fraction(hwmNet) == PREC) _burnUnindexedVest();
+            return;
+        }
         uint256 delta = target - vestedOut;
         if (delta > pool) delta = pool;
         (uint256 newAcc, uint256 pay) = _bookRelease(accVest, pool, totalPoints, delta);
         if (pay == 0) {
-            if (_fraction(hwmNet) == PREC) _burnPoolDust();
+            if (_fraction(hwmNet) == PREC) {
+                _burnPoolDust();
+                _burnUnindexedVest();
+            }
             return;
         }
         accVest = newAcc;
         pool -= pay;
         vestedOut += pay;
-        if (pool > 0 && _fraction(hwmNet) == PREC) _burnPoolDust();
+        if (_fraction(hwmNet) == PREC) {
+            if (pool > 0) _burnPoolDust();
+            _burnUnindexedVest();
+        }
+    }
+
+    /// @dev Index floors cannot assign this remainder. At full unlock it is burned,
+    ///      so a settled vest does not leave tokens in the contract.
+    function _burnUnindexedVest() internal {
+        if (block.timestamp < openTime + forfeitWindow) return;
+        if (vestedOut <= vestAssigned) return;
+        uint256 gap = vestedOut - vestAssigned;
+        // A few wei can sit above every holder's floor. A real unpaid share is larger.
+        if (gap > 4) return;
+        vestedOut -= gap;
+        burnedLocked += gap;
+        _move(address(this), address(0), gap);
     }
 
     /// @dev Move the index by the tokens that actually leave `pool`, not by the sum of
@@ -848,13 +881,22 @@ contract FairToken {
             uint256 gain = vAcc - a.vestDebt;
             uint256 room = vestedOut > vestAssigned ? vestedOut - vestAssigned : 0;
             if (gain > room) gain = room;
+            uint256 charge = forfeitChargeOf[user];
+            uint256 withheld;
+            if (charge > 0 && gain > 0) {
+                withheld = gain > charge ? charge : gain;
+                gain -= withheld;
+                forfeitChargeOf[user] = charge - withheld;
+            }
             if (gain > 0) {
                 a.claimable += gain;
                 vestAssigned += gain;
-                a.vestDebt += gain;
-                // Historical grant. A later rebase of `vestDebt` must not add this again.
                 vestGrantedOf[user] += gain;
             }
+            // Move the index past both the paid and the withheld credit. The forfeit
+            // itself stays in `forfeitChargeOf` until the tokens are routed out.
+            a.vestDebt += gain + withheld;
+            if (withheld > 0) _routeWithheld(user, withheld);
         }
         uint256 fAcc = a.points * accForfeit / PREC;
         if (fAcc > a.forfeitDebt) {
@@ -928,18 +970,11 @@ contract FairToken {
         _crystallize(user);
         uint256 pointsRemove = amt == locked ? a.points : a.points * amt / locked;
         if (pointsRemove == 0) {
-            // The forfeit is smaller than one point of the pool. Rounding the
-            // deduction up would drop a whole point and over-forfeit. The token
-            // amount is still removed from what this holder can claim.
+            // Smaller than one point of the pool. Do not round the point count up.
+            // The penalty is a token balance, not index debt, so a later rebase cannot
+            // erase it. Settlement routes these tokens to other holders or the burn.
             a.forfeitedOut += amt;
-            if (a.points == totalPoints) {
-                // Sole holder: taking the tokens out of the pool is their entire loss.
-                pool -= amt;
-                earmark += amt;
-            } else {
-                // Shared pool: do not socialize the cut. Charge it against later vest.
-                a.vestDebt += amt;
-            }
+            forfeitChargeOf[user] += amt;
             parked = amt;
             return parked;
         }
@@ -954,6 +989,18 @@ contract FairToken {
         a.vestDebt = a.points * accVest / PREC;
         a.forfeitDebt = a.points * accForfeit / PREC;
         parked = amt;
+    }
+
+    /// @dev Forfeit tokens that were released into `vestedOut` but must not be claimed.
+    ///      They join the forfeit pot and are shared by remaining points, or burned.
+    function _routeWithheld(address user, uint256 withheld) internal {
+        if (withheld == 0) return;
+        if (withheld > vestedOut) withheld = vestedOut;
+        vestedOut -= withheld;
+        earmark += withheld;
+        _flushEarmark(false, user);
+        _releaseLocked();
+        if (block.timestamp >= openTime + forfeitWindow) _burnUnindexedVest();
     }
 
     /// @param all When true, flush every wei (day-14 backstop). Otherwise flush `minUnit` chunks.

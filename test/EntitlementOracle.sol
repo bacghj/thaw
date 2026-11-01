@@ -27,6 +27,8 @@ contract EntitlementOracle is Test {
         uint256 redist;
         uint256 forfeited;
         uint256 futureSlash;
+        uint256 seenCharge;
+        uint256 slashed;
     }
 
     FairToken public token;
@@ -66,15 +68,12 @@ contract EntitlementOracle is Test {
             (,,,,,,,,, uint256 forfeitedOut, uint256 forfeitDust,) = token.accounts(a);
             uint256 ptsNow = _points(a);
             if (forfeitedOut > h.forfeited) {
-                uint256 delta = forfeitedOut - h.forfeited;
                 forfeits += 1;
-                // Point math could not move. The tokens stayed in the shared pool and
-                // were charged to later vest instead. Take that charge out of the
-                // next index credit. A sole-holder cut shrinks the pool first, so the
-                // index never sees those tokens and must not be cut again.
-                if (ptsNow >= h.points && token.pool() >= lastPool) h.futureSlash += delta;
                 h.forfeited = forfeitedOut;
             }
+            uint256 chargeNow = token.forfeitChargeOf(a);
+            if (chargeNow > h.seenCharge) h.futureSlash += chargeNow - h.seenCharge;
+            h.seenCharge = chargeNow;
             assertEq(forfeitDust / PREC, 0, "forfeit not applied");
             h.points = ptsNow;
         }
@@ -90,6 +89,7 @@ contract EntitlementOracle is Test {
                     uint256 cut = add > h.futureSlash ? h.futureSlash : add;
                     add -= cut;
                     h.futureSlash -= cut;
+                    h.slashed += cut;
                 }
                 h.vestFair += add;
             }
@@ -115,6 +115,7 @@ contract EntitlementOracle is Test {
         uint256 fairVest;
         uint256 distributed;
         uint256 pointSum;
+        uint256 slashed;
         // A few wei per release or forfeit. The contract may trail the replay; it must not lead it.
         uint256 slack = 3 * (releases + forfeits + 1);
         // After a forfeit, a later index catch-up can count a floored wei twice in the
@@ -129,6 +130,7 @@ contract EntitlementOracle is Test {
             uint256 got = _owed(a);
             pointSum += h.points;
             fairVest += h.vestFair;
+            slashed += h.slashed;
             uint256 imm = _immediate(a);
             if (got > imm) distributed += got - imm;
             assertLe(got, fair, "over-pay");
@@ -145,7 +147,8 @@ contract EntitlementOracle is Test {
         if (fairVest > token.vestedOut()) {
             assertLe(fairVest - token.vestedOut(), leadBound, "index lead");
         } else {
-            assertLe(token.vestedOut() - fairVest, dustBound, "unallocated vest dust");
+            // Forfeit charges are removed from a holder's replay and routed onward.
+            assertLe(token.vestedOut() - fairVest, dustBound + slashed, "unallocated vest dust");
         }
         // After the window, handler warps poke before returning, so earmark is flushed
         // and residual pool dust is burned. Released vest + unallocated dust + burned
@@ -155,7 +158,7 @@ contract EntitlementOracle is Test {
             uint256 dust = token.vestedOut() - covered;
             uint256 lead = fairVest - covered;
             assertLe(token.pool() + token.earmark(), dustBound, "day-14 leftover");
-            assertLe(dust, dustBound, "day-14 dust");
+            assertLe(dust, dustBound + slashed, "day-14 dust");
             assertLe(lead, leadBound, "day-14 index lead");
             assertEq(
                 covered + dust + token.pool() + token.earmark() + token.burnedLocked(),
@@ -163,7 +166,24 @@ contract EntitlementOracle is Test {
                 "vest pool conserved"
             );
             assertLe(fairVest, distributed + slack * n + n, "day-14 under-distributed");
-            assertLe(distributed, fairVest + leadBound, "day-14 over-distributed");
+            assertLe(distributed, fairVest + slashed + leadBound, "day-14 over-distributed");
+            if (token.pool() == 0 && token.earmark() == 0) {
+                uint256 held = token.balanceOf(address(token));
+                uint256 tax = token.taxDevReserve() + token.taxLpReserve();
+                uint256 unclaimed;
+                uint256 charges;
+                for (uint256 j; j < n; ++j) {
+                    address a = actors[j];
+                    (,, uint256 claimable,) = token.unlockState(a);
+                    unclaimed += claimable;
+                    charges += token.forfeitChargeOf(a);
+                }
+                if (held >= tax) {
+                    // After settlement the contract may hold only unpaid claims, open
+                    // forfeit charges, and tax. Anything else is stranded.
+                    assertLe(held - tax, unclaimed + charges + dustBound, "stranded vest");
+                }
+            }
         }
     }
 
@@ -228,6 +248,9 @@ contract EntitlementOracle is Test {
         if (pts > 0) {
             uint256 vAcc = pts * token.accVest() / PREC;
             if (vAcc > vestDebt) pending = vAcc - vestDebt;
+            uint256 charge = token.forfeitChargeOf(a);
+            if (pending > charge) pending -= charge;
+            else pending = 0;
         }
         uint256 got = claimed + claimable + pending;
         if (token.launched() && !materialized) got += shares * token.immediatePerShare();

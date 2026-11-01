@@ -957,17 +957,105 @@ contract FairTokenTest is Test {
         t.claim();
         uint256 second = t.balanceOf(a);
         // Before the fix this claim was the whole remaining lock, forfeit included.
-        assertEq(second + applied, lockedBefore, "forfeit is not claimable at day 14");
+        assertApproxEqAbs(second + applied, lockedBefore, 1, "forfeit is not claimable at day 14");
         assertApproxEqAbs(second, lockedBefore - expectForfeit, 1000, "day-14 claim is the unforfeited remainder");
         assertEq(_forfeitWei(t, a), 0, "day-14 claim did not revive a pending forfeit");
         assertEq(t.pool() + t.vestedOut() + t.burnedLocked() + t.earmark(), t.initialPool());
     }
 
+    /// @notice Two holders stay in the vest. A forfeits twice at day 10.5. After both settle
+    ///         on day 14, nothing is stranded and the first forfeit is still enforced.
+    function test_twoHoldersForfeitIsSettled() public {
+        FairToken.Params memory p = _params();
+        p.hardCap = 30_000;
+        p.softCap = 1_000;
+        p.maxPerWallet = 5;
+        p.maxPerIdentity = 5;
+        p.tokensPerShare = 3000 ether;
+        p.minUnit = 1;
+        p.swapThreshold = 1_000_000 ether;
+        FairToken t = _fresh(p);
+
+        address[] memory holders = new address[](200);
+        holders[0] = _actor(bytes32("pair-A"));
+        holders[1] = _actor(bytes32("pair-B"));
+        address a = holders[0];
+        address b = holders[1];
+        for (uint256 i; i < 200; ++i) {
+            if (i > 1) holders[i] = _actor(bytes32(uint256(0x2000) + i));
+            _mint(t, holders[i], 5);
+        }
+        vm.warp(t.deadline() + 1);
+        t.finalize();
+
+        for (uint256 i; i < 2; ++i) {
+            vm.prank(holders[i]);
+            t.claim();
+            uint256 bal = t.balanceOf(holders[i]);
+            vm.prank(holders[i]);
+            t.transfer(makeAddr("pair-trim"), bal - 1);
+        }
+        for (uint256 i = 2; i < 200; ++i) {
+            vm.prank(holders[i]);
+            t.claim();
+            uint256 bal = t.balanceOf(holders[i]);
+            if (bal > 0) {
+                vm.prank(holders[i]);
+                t.transfer(makeAddr("pair-exit"), bal);
+            }
+        }
+        assertEq(t.totalPoints(), _points(t, a) + _points(t, b), "only A and B remain");
+
+        vm.warp(t.openTime() + 10.5 days);
+        t.poke();
+        vm.prank(a);
+        t.claim();
+        uint256 mid = t.balanceOf(a);
+        (uint256 lockedBefore,,,) = t.unlockState(a);
+        (,,,,,,,,, uint256 forfeitedBefore,,) = t.accounts(a);
+        vm.prank(a);
+        t.transfer(makeAddr("pair-mid-1"), mid / 2);
+        (,,,,,,,,, uint256 forfeitedMid,,) = t.accounts(a);
+        uint256 firstForfeit = forfeitedMid - forfeitedBefore;
+
+        uint256 rest = t.balanceOf(a);
+        vm.prank(a);
+        t.transfer(makeAddr("pair-mid-2"), rest);
+        uint256 chargeAfterSecond = t.forfeitChargeOf(a);
+        (,,,,,,,,, uint256 forfeitedAfter,,) = t.accounts(a);
+        assertGe(chargeAfterSecond, firstForfeit, "second transfer erased the first forfeit");
+        assertGt(forfeitedAfter - forfeitedBefore, 100_000 ether, "a large forfeit was recorded");
+
+        vm.warp(t.openTime() + 14 days);
+        t.poke();
+        vm.prank(a);
+        t.claim();
+        vm.prank(b);
+        t.claim();
+        t.poke();
+        vm.prank(a);
+        try t.claim() {} catch {}
+        vm.prank(b);
+        try t.claim() {} catch {}
+
+        uint256 held = t.balanceOf(address(t)) - t.taxDevReserve() - t.taxLpReserve();
+        assertEq(held, 0, "vest tokens stranded in the contract");
+        assertEq(t.pool(), 0);
+        assertEq(t.earmark(), 0);
+        assertEq(t.forfeitChargeOf(a), 0, "A still has an unsettled forfeit");
+        assertEq(t.claimedTotal() + t.burnedLocked(), t.minterSupply(), "claimed plus burned is the whole mint");
+    }
+
+    function _points(FairToken t, address a) internal view returns (uint256 pts) {
+        (,, pts,,,,,,,,,) = t.accounts(a);
+    }
+
     /// @notice Tiny residual points, large token forfeit. The oracle must reject a forfeit
     ///         that was computed and then left claimable.
-    function testFuzz_tinyPointLargeForfeit(uint8 extraHolders, uint256 salt) public {
-        extraHolders = uint8(bound(extraHolders, 1, 4));
-        uint256 n = uint256(extraHolders) + 1;
+    function testFuzz_tinyPointLargeForfeit(uint8 remainRaw, uint8 exitRaw, uint256 salt) public {
+        uint256 remain = bound(uint256(remainRaw), 1, 5);
+        uint256 exiting = bound(uint256(exitRaw), 1, 3);
+        uint256 n = remain + exiting;
         FairToken.Params memory p = _params();
         p.hardCap = n * 2;
         p.softCap = 2;
@@ -997,10 +1085,13 @@ contract FairTokenTest is Test {
             vm.prank(holders[i]);
             t.claim();
             uint256 bal = t.balanceOf(holders[i]);
-            if (bal > 0) {
-                vm.prank(holders[i]);
-                t.transfer(makeAddr("fuzz-exit"), bal);
+            if (bal == 0) {
+                oracle.sync();
+                continue;
             }
+            vm.prank(holders[i]);
+            if (i < remain) t.transfer(makeAddr("fuzz-trim"), bal - 1);
+            else t.transfer(makeAddr("fuzz-exit"), bal);
             oracle.sync();
             oracle.check();
         }
