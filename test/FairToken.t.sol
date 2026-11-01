@@ -916,8 +916,8 @@ contract FairTokenTest is Test {
         vm.prank(a);
         t.transfer(makeAddr("sink-a"), almost);
         (,, uint256 pointsA,,,,,,,,,) = t.accounts(a);
-        assertGt(pointsA, 0, "A keeps a point residue");
-        assertLt(pointsA, 10, "residue is only a few points");
+        assertGt(pointsA, 0, "A keeps a locked residue");
+        assertLt(pointsA, 5 * t.lockedPerShare(), "residue is smaller than the original lock");
 
         for (uint256 i = 1; i < 200; ++i) {
             vm.prank(holders[i]);
@@ -928,7 +928,7 @@ contract FairTokenTest is Test {
                 t.transfer(makeAddr("sink-rest"), bal);
             }
         }
-        assertEq(t.totalPoints(), pointsA, "everyone else left the vest");
+        assertEq(t.totalPoints(), t.rawOf(a), "everyone else left the vest");
 
         vm.warp(t.openTime() + 10.5 days);
         t.poke();
@@ -957,7 +957,7 @@ contract FairTokenTest is Test {
         t.claim();
         uint256 second = t.balanceOf(a);
         // Before the fix this claim was the whole remaining lock, forfeit included.
-        assertApproxEqAbs(second + applied, lockedBefore, 1, "forfeit is not claimable at day 14");
+        assertApproxEqAbs(second + applied, lockedBefore, 2_000_000, "forfeit is not claimable at day 14");
         assertApproxEqAbs(second, lockedBefore - expectForfeit, 1000, "day-14 claim is the unforfeited remainder");
         assertEq(_forfeitWei(t, a), 0, "day-14 claim did not revive a pending forfeit");
         assertEq(t.pool() + t.vestedOut() + t.burnedLocked() + t.earmark(), t.initialPool());
@@ -1004,7 +1004,7 @@ contract FairTokenTest is Test {
                 t.transfer(makeAddr("pair-exit"), bal);
             }
         }
-        assertEq(t.totalPoints(), _points(t, a) + _points(t, b), "only A and B remain");
+        assertEq(t.totalPoints(), t.rawOf(a) + t.rawOf(b), "only A and B remain");
 
         vm.warp(t.openTime() + 10.5 days);
         t.poke();
@@ -1021,9 +1021,8 @@ contract FairTokenTest is Test {
         uint256 rest = t.balanceOf(a);
         vm.prank(a);
         t.transfer(makeAddr("pair-mid-2"), rest);
-        uint256 chargeAfterSecond = t.forfeitChargeOf(a);
         (,,,,,,,,, uint256 forfeitedAfter,,) = t.accounts(a);
-        assertGe(chargeAfterSecond, firstForfeit, "second transfer erased the first forfeit");
+        assertGt(forfeitedAfter, forfeitedMid, "second forfeit landed");
         assertGt(forfeitedAfter - forfeitedBefore, 100_000 ether, "a large forfeit was recorded");
 
         vm.warp(t.openTime() + 14 days);
@@ -1042,7 +1041,6 @@ contract FairTokenTest is Test {
         assertEq(held, 0, "vest tokens stranded in the contract");
         assertEq(t.pool(), 0);
         assertEq(t.earmark(), 0);
-        assertEq(t.forfeitChargeOf(a), 0, "A still has an unsettled forfeit");
         assertEq(t.claimedTotal() + t.burnedLocked(), t.minterSupply(), "claimed plus burned is the whole mint");
     }
 

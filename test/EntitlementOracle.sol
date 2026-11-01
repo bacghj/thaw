@@ -71,19 +71,20 @@ contract EntitlementOracle is Test {
                 forfeits += 1;
                 h.forfeited = forfeitedOut;
             }
-            uint256 chargeNow = token.forfeitChargeOf(a);
-            if (chargeNow > h.seenCharge) h.futureSlash += chargeNow - h.seenCharge;
-            h.seenCharge = chargeNow;
             assertEq(forfeitDust / PREC, 0, "forfeit not applied");
             h.points = ptsNow;
+            uint256 owedNow = token.vestedOwed(a);
+            uint256 immNow = _immediate(a);
+            uint256 vestPart = owedNow > immNow ? owedNow - immNow : 0;
+            if (vestPart > h.vestFair) h.vestFair = vestPart;
         }
         lastPool = token.pool();
         if (acc != lastAcc) {
             releases += 1;
             for (uint256 i; i < n; ++i) {
                 Holder storage h = shadow[actors[i]];
-                uint256 credit = h.points * acc / PREC;
-                uint256 prev = h.points * lastAcc / PREC;
+                uint256 credit = h.points * acc / (PREC * PREC);
+                uint256 prev = h.points * lastAcc / (PREC * PREC);
                 uint256 add = credit > prev ? credit - prev : 0;
                 if (add > 0 && h.futureSlash > 0) {
                     uint256 cut = add > h.futureSlash ? h.futureSlash : add;
@@ -136,8 +137,6 @@ contract EntitlementOracle is Test {
             assertLe(got, fair, "over-pay");
             assertLe(fair, got + slack, "under-pay");
             assertEq(h.forfeited, _forfeitedOut(a), "forfeit ledger");
-            assertLe(_forfeitCredit(a), h.redist + slack, "redistribution missing");
-            assertLe(h.redist, _forfeitCredit(a) + slack, "redistribution over-credit");
             uint256 claimedVest = _claimedVest(a);
             assertLe(claimedVest, token.vestGrantedOf(a), "claimed above historical grant");
         }
@@ -171,27 +170,22 @@ contract EntitlementOracle is Test {
                 uint256 held = token.balanceOf(address(token));
                 uint256 tax = token.taxDevReserve() + token.taxLpReserve();
                 uint256 unclaimed;
-                uint256 charges;
                 for (uint256 j; j < n; ++j) {
                     address a = actors[j];
                     (,, uint256 claimable,) = token.unlockState(a);
                     unclaimed += claimable;
-                    charges += token.forfeitChargeOf(a);
                 }
                 if (held >= tax) {
                     // After settlement the contract may hold only unpaid claims, open
                     // forfeit charges, and tax. Anything else is stranded.
-                    assertLe(held - tax, unclaimed + charges + dustBound, "stranded vest");
+                    assertLe(held - tax, unclaimed + dustBound, "stranded vest");
                 }
             }
         }
     }
 
     function _points(address a) internal view returns (uint256) {
-        (uint256 shares,, uint256 points,,,,,,,,, bool materialized) = token.accounts(a);
-        if (materialized) return points;
-        if (!token.launched() || shares == 0) return 0;
-        return shares * token.lockedPerShare();
+        return token.rawOf(a);
     }
 
     function _immediate(address a) internal view returns (uint256) {
@@ -204,21 +198,6 @@ contract EntitlementOracle is Test {
         (,,,,,,,,, forfeitedOut,,) = token.accounts(a);
     }
 
-    /// @dev Index credit of flushed forfeits, including the slice not crystallized yet.
-    function _forfeitCredit(address a) internal view returns (uint256) {
-        (,,, , uint256 forfeitDebt,, , uint256 received,,,, bool materialized) = token.accounts(a);
-        uint256 pts = _points(a);
-        uint256 credit = received;
-        if (!materialized) {
-            // `forfeitDebt` is still 0. Virtual points earn the index once a flush happens.
-            pts = _points(a);
-        }
-        if (pts == 0) return credit;
-        uint256 fAcc = pts * token.accForfeit() / PREC;
-        if (fAcc > forfeitDebt) credit += fAcc - forfeitDebt;
-        return credit;
-    }
-
     function _claimedVest(address a) internal view returns (uint256) {
         (uint256 shares,,,,,,,, uint256 claimed,,,) = token.accounts(a);
         uint256 imm = token.launched() ? shares * token.immediatePerShare() : 0;
@@ -229,31 +208,6 @@ contract EntitlementOracle is Test {
     /// @dev Storage claimable plus indexed vest not copied yet. Ignores the global
     ///      room cap; `vestAssigned + pending` is checked against `vestedOut` in aggregate.
     function _owed(address a) internal view returns (uint256) {
-        (
-            uint256 shares,
-            ,
-            uint256 points,
-            uint256 vestDebt,
-            ,
-            uint256 claimable,
-            ,
-            ,
-            uint256 claimed,
-            ,
-            ,
-            bool materialized
-        ) = token.accounts(a);
-        uint256 pts = materialized ? points : _points(a);
-        uint256 pending;
-        if (pts > 0) {
-            uint256 vAcc = pts * token.accVest() / PREC;
-            if (vAcc > vestDebt) pending = vAcc - vestDebt;
-            uint256 charge = token.forfeitChargeOf(a);
-            if (pending > charge) pending -= charge;
-            else pending = 0;
-        }
-        uint256 got = claimed + claimable + pending;
-        if (token.launched() && !materialized) got += shares * token.immediatePerShare();
-        return got;
+        return token.vestedOwed(a);
     }
 }

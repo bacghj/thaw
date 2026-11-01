@@ -127,9 +127,9 @@ contract FairToken {
     struct Account {
         uint256 shares;
         uint256 paid;
-        uint256 points;
+        uint256 points; // raw shares. Locked wei = raw * vestScale / PREC, plus unsettled bonuses.
         uint256 vestDebt;
-        uint256 forfeitDebt;
+        uint256 forfeitDebt; // accForfeit index at last settle (not raw * index)
         uint256 claimable;
         uint256 liquidBaseline;
         uint256 forfeitedReceived;
@@ -162,6 +162,8 @@ contract FairToken {
     uint256 public constant LP_BPS = 150;
     uint256 public constant BPS = 10_000;
     uint256 public constant PREC = 1e18;
+    /// @dev Raw shares are locked wei. 1 raw = 1 wei, so a 1-wei position cannot round away.
+    uint256 private constant RAW = 1;
     address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
 
     // -------------------------------------------------------------------------
@@ -211,6 +213,7 @@ contract FairToken {
     uint256 public totalSupply;
 
     mapping(address => Account) public accounts;
+    address[] public minters;
     mapping(bytes32 => uint256) public idShares;
 
     uint256 public sold;
@@ -225,16 +228,20 @@ contract FairToken {
     uint256 public pool;
     uint256 public totalPoints;
     uint256 public accVest;
+    /// @notice Cumulative raw-share bonus, scaled by `PREC`, credited to holders other than the seller.
     uint256 public accForfeit;
+    /// @notice `vestIndex` captured inside `accForfeit`, so a bonus does not earn vest from before it existed.
+    uint256 public accRawVest;
+    /// @notice Converts raw shares into locked wei: `locked = raw * vestScale / PREC`. Starts at `PREC`.
+    uint256 public vestScale;
     uint256 public vestedOut;
     /// @notice Vest tokens already copied into some account's `claimable`. Always <= `vestedOut`.
     ///         The gap `vestedOut - vestAssigned` is unallocated dust and stays in the pool's favour.
     uint256 public vestAssigned;
     /// @notice Lifetime vest wei copied into each account. Never reduced when a forfeit rebases `vestDebt`.
     mapping(address => uint256) public vestGrantedOf;
-    /// @notice Token wei this holder still owes from forfeits that did not move points.
-    ///         Independent of `vestDebt`, so a later point rebase cannot erase it.
-    mapping(address => uint256) public forfeitChargeOf;
+    /// @notice `accRawVest` the last time this holder was settled.
+    mapping(address => uint256) public rawVestSnap;
     uint256 public burnedLocked;
     uint256 public earmark;
     uint256 public initialPool;
@@ -383,27 +390,16 @@ contract FairToken {
         view
         returns (uint256 locked, uint256 unlocked, uint256 claimable, uint256 forfeitedReceived)
     {
-        (uint256 acc, uint256 poolAfter) = _previewVest();
+        (uint256 acc,, uint256 scaleAfter) = _previewVest();
         Account storage a = accounts[account];
-        uint256 pts = a.materialized ? a.points : (launched ? a.shares * lockedPerShare : 0);
-        uint256 pending;
-        if (pts > 0) {
-            uint256 got = pts * acc / PREC;
-            if (got > a.vestDebt) pending = got - a.vestDebt;
-            uint256 charge = forfeitChargeOf[account];
-            if (pending > charge) pending -= charge;
-            else pending = 0;
-            uint256 room = vestedOut > vestAssigned ? vestedOut - vestAssigned : 0;
-            if (pending > room) pending = room;
-        }
+        uint256 pending = _vestGain(account, acc);
+        uint256 room = vestedOut > vestAssigned ? vestedOut - vestAssigned : 0;
+        if (pending > room) pending = room;
         claimable = a.claimable + pending;
         if (launched && a.shares > 0 && !a.materialized) claimable += a.shares * immediatePerShare;
-        locked = (totalPoints == 0 || pts == 0) ? 0 : pts * poolAfter / totalPoints;
-        forfeitedReceived = a.forfeitedReceived;
-        if (pts > 0) {
-            uint256 fg = pts * accForfeit / PREC;
-            if (fg > a.forfeitDebt) forfeitedReceived += fg - a.forfeitDebt;
-        }
+        uint256 raw = _virtualRaw(account);
+        locked = raw == 0 ? 0 : FullMath.mulDiv(raw, scaleAfter, PREC * RAW);
+        forfeitedReceived = a.forfeitedReceived + _pendingRedist(account, scaleAfter);
         unlocked = a.claimed + claimable;
     }
 
@@ -458,6 +454,7 @@ contract FairToken {
 
         sold += shares;
         raised += msg.value;
+        if (a.shares == 0) minters.push(msg.sender);
         a.shares += shares;
         a.paid += msg.value;
         idShares[id] += shares;
@@ -502,7 +499,10 @@ contract FairToken {
         minterSupply = sold * tokensPerShare;
         initialPool = sold * lockedPerShare;
         pool = initialPool;
-        totalPoints = initialPool;
+        totalPoints = initialPool * RAW;
+        vestScale = PREC;
+        // 1e36, not 1e18: a 1-ulp factor error must stay far below 1 raw unit.
+        accForfeit = PREC * PREC;
 
         address p = IPancakeFactory(factory).getPair(address(this), wbnb);
         if (p == address(0)) p = IPancakeFactory(factory).createPair(address(this), wbnb);
@@ -622,11 +622,10 @@ contract FairToken {
         if (inSwap) revert Reentrancy();
         if (!launched) revert TransferDisabled();
 
-        // Forfeit before this block's vest commit so the penalty uses still-locked tokens.
+        // Unlock whatever time has already earned, then forfeit only what is still locked.
         // Self-transfers do not leave the wallet, so they are not sells.
-        if (from != pair && from != to) _noteSale(from, value);
-
         _checkpoint();
+        if (from != pair && from != to) _noteSale(from, value);
 
         // A pair-to-pair move (skim to the pair, sync leftovers routed back) does not
         // take tokens out of the pool. Counting it as a buy lets the same balance
@@ -762,7 +761,7 @@ contract FairToken {
         }
         uint256 delta = target - vestedOut;
         if (delta > pool) delta = pool;
-        (uint256 newAcc, uint256 pay) = _bookRelease(accVest, pool, totalPoints, delta);
+        uint256 pay = _vestHolders(delta);
         if (pay == 0) {
             if (_fraction(hwmNet) == PREC) {
                 _burnPoolDust();
@@ -770,12 +769,34 @@ contract FairToken {
             }
             return;
         }
-        accVest = newAcc;
         pool -= pay;
         vestedOut += pay;
+        vestScale = totalPoints == 0 ? PREC : FullMath.mulDiv(pool, PREC * RAW, totalPoints);
         if (_fraction(hwmNet) == PREC) {
             if (pool > 0) _burnPoolDust();
             _burnUnindexedVest();
+        }
+    }
+
+    /// @dev Move `delta` out of holders in proportion to current locked wei. Same floor as the reference model.
+    function _vestHolders(uint256 delta) internal returns (uint256 assigned) {
+        uint256 poolBefore = pool;
+        uint256 n = minters.length;
+        if (poolBefore == 0 || n == 0) return 0;
+        for (uint256 i; i < n; ++i) {
+            address u = minters[i];
+            uint256 w = _lockedOf(u);
+            if (w == 0) continue;
+            uint256 cut = w * delta / poolBefore;
+            if (cut == 0) continue;
+            _crystallize(u);
+            if (cut > accounts[u].points) cut = accounts[u].points;
+            accounts[u].points -= cut;
+            totalPoints -= cut;
+            accounts[u].claimable += cut;
+            vestAssigned += cut;
+            vestGrantedOf[u] += cut;
+            assigned += cut;
         }
     }
 
@@ -800,15 +821,16 @@ contract FairToken {
         pure
         returns (uint256 newAcc, uint256 pay)
     {
+        uint256 div = PREC * RAW;
         if (points == 0 || poolBal == 0 || delta == 0) return (acc, 0);
         if (delta > poolBal) delta = poolBal;
-        uint256 per = delta * PREC / points;
-        uint256 credited = per == 0 ? 0 : per * points / PREC;
+        uint256 per = FullMath.mulDiv(delta, div, points);
+        uint256 credited = per == 0 ? 0 : FullMath.mulDiv(per, points, div);
         if (credited == 0) return (acc, 0);
-        uint256 already = acc * points / PREC;
-        uint256 accTry = (already + credited) * PREC / points;
+        uint256 already = FullMath.mulDiv(acc, points, div);
+        uint256 accTry = FullMath.mulDiv(already + credited, div, points);
         if (accTry <= acc) return (acc, 0);
-        uint256 assignable = accTry * points / PREC;
+        uint256 assignable = FullMath.mulDiv(accTry, points, div);
         if (assignable <= already) return (acc, 0);
         pay = assignable - already;
         if (pay > poolBal) return (acc, 0);
@@ -819,6 +841,7 @@ contract FairToken {
         uint256 dust = pool;
         if (dust == 0) return;
         pool = 0;
+        vestScale = 0;
         burnedLocked += dust;
         _move(address(this), address(0), dust);
     }
@@ -841,10 +864,11 @@ contract FairToken {
         return (t - start) * PREC / vestLinear;
     }
 
-    function _previewVest() internal view returns (uint256 acc, uint256 poolAfter) {
+    function _previewVest() internal view returns (uint256 acc, uint256 poolAfter, uint256 scaleAfter) {
         acc = accVest;
         poolAfter = pool;
-        if (!launched || totalPoints == 0 || poolAfter == 0) return (acc, poolAfter);
+        scaleAfter = vestScale;
+        if (!launched || totalPoints == 0 || poolAfter == 0) return (acc, poolAfter, scaleAfter);
         uint256 h = previewHwm();
         uint256 base = initialPool - burnedLocked;
         uint256 frac = base == 0 ? PREC : 0;
@@ -855,62 +879,114 @@ contract FairToken {
             frac = demandFrac > timeFrac ? demandFrac : timeFrac;
         }
         uint256 target = base * frac / PREC;
-        if (target <= vestedOut) return (acc, poolAfter);
+        if (target <= vestedOut) return (acc, poolAfter, scaleAfter);
         uint256 delta = target - vestedOut;
         if (delta > poolAfter) delta = poolAfter;
         (uint256 newAcc, uint256 pay) = _bookRelease(acc, poolAfter, totalPoints, delta);
-        if (pay == 0) return (acc, poolAfter);
+        if (pay == 0) return (acc, poolAfter, scaleAfter);
         acc = newAcc;
         poolAfter -= pay;
+        scaleAfter = FullMath.mulDiv(poolAfter, PREC * RAW, totalPoints);
     }
 
     function _ensurePoints(address user) internal {
         Account storage a = accounts[user];
         if (!launched || a.shares == 0 || a.materialized) return;
-        a.points = a.shares * lockedPerShare;
+        a.points = a.shares * lockedPerShare * RAW;
+        a.forfeitDebt = PREC * PREC;
         a.materialized = true;
         a.claimable += a.shares * immediatePerShare;
     }
 
+    /// @dev Stored raw scaled by the redistribution factor since this holder last settled.
+    function _virtualRaw(address user) internal view returns (uint256 raw) {
+        Account storage a = accounts[user];
+        if (a.materialized) raw = a.points;
+        else if (launched && a.shares > 0) raw = a.shares * lockedPerShare * RAW;
+        if (raw == 0 || accForfeit == 0) return raw;
+        uint256 snap = a.materialized ? a.forfeitDebt : PREC * PREC;
+        if (snap == 0) snap = PREC * PREC;
+        raw = FullMath.mulDiv(raw, accForfeit, snap);
+    }
+
+    /// @notice Raw shares including unsettled redistribution. Sums to `totalPoints`.
+    function rawOf(address user) external view returns (uint256) {
+        return _virtualRaw(user);
+    }
+
+    /// @notice `claimed + claimable`, using the committed vest index (no hypothetical release).
+    function vestedOwed(address user) external view returns (uint256) {
+        Account storage a = accounts[user];
+        uint256 pending = _vestGain(user, accVest);
+        uint256 room = vestedOut > vestAssigned ? vestedOut - vestAssigned : 0;
+        if (pending > room) pending = room;
+        uint256 out = a.claimable + pending;
+        if (launched && a.shares > 0 && !a.materialized) out += a.shares * immediatePerShare;
+        return a.claimed + out;
+    }
+
+    function _storedRaw(address user) internal view returns (uint256 stored) {
+        Account storage a = accounts[user];
+        if (a.materialized) return a.points;
+        if (launched && a.shares > 0) return a.shares * lockedPerShare * RAW;
+    }
+
+    function _factorSnap(address user) internal view returns (uint256 snap) {
+        Account storage a = accounts[user];
+        snap = a.materialized ? a.forfeitDebt : PREC * PREC;
+        if (snap == 0) snap = PREC * PREC;
+    }
+
+    /// @dev Vest wei earned and not yet copied into `claimable`.
+    ///      Raw created by a later redistribution does not earn vest from before it existed.
+    function _vestGain(address user, uint256 acc) internal view returns (uint256 pay) {
+        uint256 stored = _storedRaw(user);
+        if (stored == 0 || accForfeit == 0) return 0;
+        uint256 snap = _factorSnap(user);
+        uint256 virtualRaw = FullMath.mulDiv(stored, accForfeit, snap);
+        uint256 gross = FullMath.mulDiv(virtualRaw, acc, PREC * RAW);
+        uint256 birth = rawVestSnap[user];
+        uint256 correction = accRawVest > birth ? FullMath.mulDiv(stored, accRawVest - birth, snap) : 0;
+        uint256 base = accounts[user].vestDebt + correction;
+        if (gross > base) pay = gross - base;
+    }
+
+    /// @dev Redistribution wei not yet written into `forfeitedReceived`.
+    function _pendingRedist(address user, uint256 scale) internal view returns (uint256) {
+        uint256 stored = _storedRaw(user);
+        uint256 virtualRaw = _virtualRaw(user);
+        if (virtualRaw <= stored || scale == 0) return 0;
+        return FullMath.mulDiv(virtualRaw - stored, scale, PREC * RAW);
+    }
+
+    /// @dev Copy vest and redistribution into the account. After this returns there is
+    ///      no determined-but-uncollected forfeit: the next forfeit reads the raw balance.
     function _crystallize(address user) internal {
         _ensurePoints(user);
         Account storage a = accounts[user];
-        if (a.points == 0 && a.vestDebt == 0 && a.forfeitDebt == 0) return;
-        uint256 vAcc = a.points * accVest / PREC;
-        if (vAcc > a.vestDebt) {
-            uint256 gain = vAcc - a.vestDebt;
-            uint256 room = vestedOut > vestAssigned ? vestedOut - vestAssigned : 0;
-            if (gain > room) gain = room;
-            uint256 charge = forfeitChargeOf[user];
-            uint256 withheld;
-            if (charge > 0 && gain > 0) {
-                withheld = gain > charge ? charge : gain;
-                gain -= withheld;
-                forfeitChargeOf[user] = charge - withheld;
-            }
-            if (gain > 0) {
-                a.claimable += gain;
-                vestAssigned += gain;
-                vestGrantedOf[user] += gain;
-            }
-            // Move the index past both the paid and the withheld credit. The forfeit
-            // itself stays in `forfeitChargeOf` until the tokens are routed out.
-            a.vestDebt += gain + withheld;
-            if (withheld > 0) _routeWithheld(user, withheld);
+        uint256 stored = a.points;
+        if (stored == 0 && a.vestDebt == 0 && a.forfeitDebt == 0 && accForfeit == 0) return;
+        uint256 pay = _vestGain(user, accVest);
+        uint256 room = vestedOut > vestAssigned ? vestedOut - vestAssigned : 0;
+        if (pay > room) pay = room;
+        if (pay > 0) {
+            a.claimable += pay;
+            vestAssigned += pay;
+            vestGrantedOf[user] += pay;
         }
-        uint256 fAcc = a.points * accForfeit / PREC;
-        if (fAcc > a.forfeitDebt) {
-            a.forfeitedReceived += fAcc - a.forfeitDebt;
-            a.forfeitDebt = fAcc;
-        }
+        uint256 virtualRaw = _virtualRaw(user);
+        if (virtualRaw > stored) a.forfeitedReceived += FullMath.mulDiv(virtualRaw - stored, vestScale, PREC * RAW);
+        a.points = virtualRaw;
+        a.forfeitDebt = accForfeit;
+        rawVestSnap[user] = accRawVest;
+        a.vestDebt = FullMath.mulDiv(virtualRaw, accVest, PREC * RAW);
     }
 
     function _lockedOf(address user) internal view returns (uint256) {
-        Account storage a = accounts[user];
-        if (!launched || totalPoints == 0) return 0;
-        uint256 pts = a.materialized ? a.points : a.shares * lockedPerShare;
-        if (pts == 0) return 0;
-        return pts * pool / totalPoints;
+        if (!launched || totalPoints == 0 || vestScale == 0) return 0;
+        uint256 raw = _virtualRaw(user);
+        if (raw == 0) return 0;
+        return FullMath.mulDiv(raw, vestScale, PREC * RAW);
     }
 
     /// @dev X% of liquid baseline, times rate(t), applied immediately into `earmark` so it cannot vest.
@@ -942,7 +1018,7 @@ contract FairToken {
         uint256 locked = _lockedOf(user);
         if (locked == 0) return;
         // addScaled = locked * (soldAmt / baseline) * rate   (wei * 1e18)
-        uint256 addScaled = FullMath.mulDiv(locked * rate, soldAmt, baseline);
+        uint256 addScaled = FullMath.mulDiv(FullMath.mulDiv(locked, soldAmt, baseline), rate, PREC) * PREC;
         a.forfeitDust += addScaled;
         _pullForfeit(user);
     }
@@ -955,65 +1031,55 @@ contract FairToken {
         if (rawWei == 0) return;
         uint256 parked = _park(user, rawWei);
         if (parked == 0) return;
-        a.forfeitDust -= parked * PREC;
+        uint256 cleared = parked > rawWei ? rawWei : parked;
+        a.forfeitDust -= cleared * PREC;
         _flushEarmark(false, user);
     }
 
     function _park(address user, uint256 amt) internal returns (uint256 parked) {
         Account storage a = accounts[user];
-        uint256 locked = _lockedOf(user);
-        if (amt == 0 || locked == 0 || a.points == 0 || totalPoints == 0) return 0;
-        if (amt > locked) amt = locked;
-        if (amt == 0) return 0;
-        // Copy the current index into `claimable` first. Those tokens stay with the holder.
-        // `vestGrantedOf` is the historical total and is not reduced below.
+        // Settle first so `points` is the raw still owned, with no unpaid forfeit sitting beside it.
         _crystallize(user);
-        uint256 pointsRemove = amt == locked ? a.points : a.points * amt / locked;
-        if (pointsRemove == 0) {
-            // Smaller than one point of the pool. Do not round the point count up.
-            // The penalty is a token balance, not index debt, so a later rebase cannot
-            // erase it. Settlement routes these tokens to other holders or the burn.
-            a.forfeitedOut += amt;
-            forfeitChargeOf[user] += amt;
-            parked = amt;
-            return parked;
+        if (amt == 0 || a.points == 0 || totalPoints == 0 || vestScale == 0) return 0;
+        uint256 locked = FullMath.mulDiv(a.points, vestScale, PREC * RAW);
+        if (locked == 0) return 0;
+        if (amt > locked) amt = locked;
+        uint256 newLocked = locked - amt;
+        uint256 newRaw = FullMath.mulDiv(newLocked, PREC * RAW, vestScale);
+        uint256 kept = FullMath.mulDiv(newRaw, vestScale, PREC * RAW);
+        // Prefer removing at most `amt`. An extra raw unit would over-forfeit.
+        if (kept < newLocked && newRaw < a.points) {
+            newRaw += 1;
+            kept = FullMath.mulDiv(newRaw, vestScale, PREC * RAW);
+            if (kept > locked) kept = locked;
         }
-        a.points -= pointsRemove;
-        totalPoints -= pointsRemove;
-        pool -= amt;
-        a.forfeitedOut += amt;
-        earmark += amt;
-        // Re-base both debts onto the surviving points. The debt drop is the removed
-        // points' settled credit; it is not a new claim. Keeping the pre-forfeit debt
-        // subtracts that credit a second time from every later release.
-        a.vestDebt = a.points * accVest / PREC;
-        a.forfeitDebt = a.points * accForfeit / PREC;
-        parked = amt;
-    }
-
-    /// @dev Forfeit tokens that were released into `vestedOut` but must not be claimed.
-    ///      They join the forfeit pot and are shared by remaining points, or burned.
-    function _routeWithheld(address user, uint256 withheld) internal {
-        if (withheld == 0) return;
-        if (withheld > vestedOut) withheld = vestedOut;
-        vestedOut -= withheld;
-        earmark += withheld;
-        _flushEarmark(false, user);
-        _releaseLocked();
-        if (block.timestamp >= openTime + forfeitWindow) _burnUnindexedVest();
+        if (kept > locked) kept = locked;
+        uint256 removed = locked - kept;
+        if (removed > amt) removed = amt;
+        if (removed == 0) return 0;
+        uint256 oldRaw = a.points;
+        if (newRaw > oldRaw) newRaw = oldRaw;
+        if (oldRaw > totalPoints || removed > pool) revert CapExceeded(oldRaw, totalPoints);
+        a.points = newRaw;
+        totalPoints = totalPoints - oldRaw + newRaw;
+        pool -= removed;
+        vestScale = totalPoints == 0 ? PREC : FullMath.mulDiv(pool, PREC * RAW, totalPoints);
+        // Re-base the vest debt onto the surviving raw. The removed raw's credit was
+        // already copied into `claimable` by `_crystallize` and must not be paid again.
+        a.vestDebt = FullMath.mulDiv(newRaw, accVest, PREC * RAW);
+        a.forfeitedOut += removed;
+        earmark += removed;
+        parked = removed;
     }
 
     /// @param all When true, flush every wei (day-14 backstop). Otherwise flush `minUnit` chunks.
-    /// @param exclude Seller to test "anyone else still locked". If they are the only holder, burn.
+    /// @param exclude Seller. Their remaining raw does not receive this pot; if nobody else
+    ///        has raw, the tokens are burned.
     function _flushEarmark(bool all, address exclude) internal {
         uint256 amt = all ? earmark : (earmark / minUnit) * minUnit;
         if (amt == 0) return;
 
-        uint256 others = totalPoints;
-        if (exclude != address(0) && totalPoints >= accounts[exclude].points) {
-            others = totalPoints - accounts[exclude].points;
-        }
-        if (others == 0 || totalPoints == 0) {
+        if (totalPoints == 0 || vestScale == 0) {
             earmark -= amt;
             burnedLocked += amt;
             _move(address(this), address(0), amt);
@@ -1021,24 +1087,46 @@ contract FairToken {
             return;
         }
 
-        uint256 per = amt * PREC / totalPoints;
-        if (per == 0) {
-            earmark -= amt;
-            burnedLocked += amt;
-            _move(address(this), address(0), amt);
-            emit Forfeited(exclude, amt, 0, amt);
-            return;
-        }
-        uint256 credited = per * totalPoints / PREC;
+        uint256 credited = _spread(exclude, amt);
         uint256 dust = amt - credited;
         earmark -= amt;
-        pool += credited;
-        accForfeit += per;
+        if (credited > 0) {
+            pool += credited;
+            vestScale = FullMath.mulDiv(pool, PREC * RAW, totalPoints);
+        }
         if (dust > 0) {
             burnedLocked += dust;
             _move(address(this), address(0), dust);
         }
         emit Forfeited(exclude, amt, credited, dust);
+    }
+
+    /// @dev Pay `amt` to every holder except the seller, in proportion to current locked wei.
+    ///      Dust that does not divide evenly is left for the caller to burn.
+    function _spread(address seller, uint256 amt) internal returns (uint256 credited) {
+        uint256 n = minters.length;
+        uint256 others;
+        for (uint256 i; i < n; ++i) {
+            if (minters[i] == seller) continue;
+            others += _lockedOf(minters[i]);
+        }
+        if (others == 0) return 0;
+        uint256 scale = vestScale;
+        for (uint256 i; i < n; ++i) {
+            address u = minters[i];
+            if (u == seller) continue;
+            uint256 w = _lockedOf(u);
+            if (w == 0) continue;
+            uint256 add = amt * w / others;
+            if (add == 0) continue;
+            _crystallize(u);
+            uint256 addRaw = FullMath.mulDiv(add, PREC * RAW, scale);
+            accounts[u].points += addRaw;
+            accounts[u].forfeitedReceived += add;
+            accounts[u].vestDebt = FullMath.mulDiv(accounts[u].points, accVest, PREC * RAW);
+            totalPoints += addRaw;
+            credited += add;
+        }
     }
 
     // -------------------------------------------------------------------------
