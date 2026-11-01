@@ -5,7 +5,7 @@ import {CommonBase} from "forge-std/Base.sol";
 import {StdCheats} from "forge-std/StdCheats.sol";
 import {StdUtils} from "forge-std/StdUtils.sol";
 import {FairToken} from "../../src/FairToken.sol";
-import {MiniRouter, MiniWBNB} from "../mocks/MiniAmm.sol";
+import {MiniPair, MiniRouter, MiniWBNB} from "../mocks/MiniAmm.sol";
 
 contract FairHandler is CommonBase, StdCheats, StdUtils {
     FairToken public token;
@@ -71,5 +71,13 @@ contract FairHandler is CommonBase, StdCheats, StdUtils {
         path[1] = address(wbnb);
         router.swapExactTokensForETHSupportingFeeOnTransferTokens(amt, 0, path, a, block.timestamp);
         vm.stopPrank();
+    }
+
+    function skimPairToSelf() external {
+        MiniPair(token.pair()).skim(token.pair());
+    }
+
+    function syncPair() external {
+        MiniPair(token.pair()).sync();
     }
 }

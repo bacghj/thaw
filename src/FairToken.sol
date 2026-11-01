@@ -566,9 +566,11 @@ contract FairToken {
     }
 
     /// @dev Swapback is external so the sell path can try/catch it. Only this contract may call it.
-    function execSwapBack(uint256 devAmt, uint256 lpAmt) external {
+    ///      Returns the token amounts that were not consumed, so a router that deposits
+    ///      only part of the requested liquidity cannot erase the remainder from the books.
+    function execSwapBack(uint256 devAmt, uint256 lpAmt) external returns (uint256 devLeft, uint256 lpLeft) {
         if (msg.sender != address(this)) revert Forbidden();
-        _execSwapBack(devAmt, lpAmt);
+        return _execSwapBack(devAmt, lpAmt);
     }
 
     receive() external payable {
@@ -612,6 +614,14 @@ contract FairToken {
 
         _checkpoint();
 
+        // A pair-to-pair move (skim to the pair, sync leftovers routed back) does not
+        // take tokens out of the pool. Counting it as a buy lets the same balance
+        // raise the high-water mark on every call.
+        if (from == pair && to == pair) {
+            _move(from, to, value);
+            return;
+        }
+
         bool isBuy = from == pair;
         bool isSell = to == pair;
         if (!isBuy && !isSell) {
@@ -649,7 +659,7 @@ contract FairToken {
         emit Transfer(from, to, value);
     }
 
-    function _execSwapBack(uint256 devAmt, uint256 lpAmt) internal {
+    function _execSwapBack(uint256 devAmt, uint256 lpAmt) internal returns (uint256 devLeft, uint256 lpLeft) {
         address[] memory path = new address[](2);
         path[0] = address(this);
         path[1] = wbnb;
@@ -658,25 +668,39 @@ contract FairToken {
         if (minterSupply > burnedLocked + claimedTotal) owed = minterSupply - burnedLocked - claimedTotal;
         if (balanceOf[address(this)] < owed + devAmt + lpAmt) revert Forbidden();
 
+        devLeft = devAmt;
+        lpLeft = lpAmt;
+
         if (devAmt > 0) {
+            uint256 beforeTok = balanceOf[address(this)];
             allowance[address(this)][router] = devAmt;
             emit Approval(address(this), router, devAmt);
             IPancakeRouter(router).swapExactTokensForETHSupportingFeeOnTransferTokens(devAmt, 0, path, devWallet, block.timestamp);
+            uint256 spent = beforeTok - balanceOf[address(this)];
+            devLeft = devAmt > spent ? devAmt - spent : 0;
         }
 
         if (lpAmt >= minUnit * 2) {
             uint256 half = lpAmt / 2;
             uint256 other = lpAmt - half;
-            uint256 beforeBal = address(this).balance;
+            uint256 beforeTok = balanceOf[address(this)];
             allowance[address(this)][router] = half;
             emit Approval(address(this), router, half);
             IPancakeRouter(router).swapExactTokensForETHSupportingFeeOnTransferTokens(half, 0, path, address(this), block.timestamp);
-            uint256 gained = address(this).balance - beforeBal;
-            if (gained > 0 && other > 0) {
+            uint256 swapped = beforeTok - balanceOf[address(this)];
+
+            // Include BNB the router refunded on an earlier partial add, not only this swap.
+            uint256 ethBal = address(this).balance;
+            uint256 usedToken;
+            if (ethBal > 0 && other > 0) {
                 allowance[address(this)][router] = other;
                 emit Approval(address(this), router, other);
-                IPancakeRouter(router).addLiquidityETH{value: gained}(address(this), other, 0, 0, DEAD, block.timestamp);
+                (usedToken,,) = IPancakeRouter(router).addLiquidityETH{value: ethBal}(
+                    address(this), other, 0, 0, DEAD, block.timestamp
+                );
             }
+            uint256 consumed = swapped + usedToken;
+            lpLeft = lpAmt > consumed ? lpAmt - consumed : 0;
         }
         emit SwapBack(devAmt, lpAmt);
     }
@@ -687,9 +711,9 @@ contract FairToken {
         uint256 lpAmt = taxLpReserve;
         if (devAmt + lpAmt < swapThreshold) return;
         inSwap = true;
-        try this.execSwapBack(devAmt, lpAmt) {
-            taxDevReserve = 0;
-            taxLpReserve = 0;
+        try this.execSwapBack(devAmt, lpAmt) returns (uint256 devLeft, uint256 lpLeft) {
+            taxDevReserve = devLeft;
+            taxLpReserve = lpLeft;
         } catch {}
         inSwap = false;
     }
@@ -718,11 +742,13 @@ contract FairToken {
         uint256 delta = target - vestedOut;
         if (delta > pool) delta = pool;
         uint256 per = delta * PREC / totalPoints;
-        if (per == 0) {
+        // `per * totalPoints / PREC` can be 0 even when `per` is not, once `totalPoints < 1e18`.
+        // Adding `per` anyway lets claims accumulate while `vestedOut` stays put.
+        uint256 credited = per == 0 ? 0 : per * totalPoints / PREC;
+        if (credited == 0) {
             if (_fraction(hwmNet) == PREC) _burnPoolDust();
             return;
         }
-        uint256 credited = per * totalPoints / PREC;
         accVest += per;
         pool -= credited;
         vestedOut += credited;
@@ -773,8 +799,8 @@ contract FairToken {
         uint256 delta = target - vestedOut;
         if (delta > poolAfter) delta = poolAfter;
         uint256 per = delta * PREC / totalPoints;
-        if (per == 0) return (acc, poolAfter);
-        uint256 credited = per * totalPoints / PREC;
+        uint256 credited = per == 0 ? 0 : per * totalPoints / PREC;
+        if (credited == 0) return (acc, poolAfter);
         acc += per;
         poolAfter -= credited;
     }

@@ -757,6 +757,227 @@ contract FairTokenTest is Test {
         d.run();
     }
 
+    function test_pairSelfSkimDoesNotInflateDemand() public {
+        FairToken.Params memory p = _params();
+        p.swapThreshold = 1_000_000 ether;
+        FairToken t = _fresh(p);
+        address a = _actor(bytes32("skim"));
+        _fillAndFinalize(t, a);
+        _roll();
+        vm.prank(a);
+        t.claim();
+        address pair = t.pair();
+        uint256 bal = t.balanceOf(a);
+        vm.prank(a);
+        t.transfer(pair, bal / 2);
+        MiniPair(pair).skim(pair);
+        MiniPair(pair).skim(pair);
+        MiniPair(pair).skim(pair);
+        _roll();
+        t.poke();
+        assertEq(t.hwmNet(), 0, "self-skim");
+    }
+
+    function test_skimToUserAndSyncDoNotCreateDemand() public {
+        FairToken.Params memory p = _params();
+        p.swapThreshold = 1_000_000 ether;
+        FairToken t = _fresh(p);
+        address a = _actor(bytes32("sync"));
+        _fillAndFinalize(t, a);
+        _roll();
+        vm.prank(a);
+        t.claim();
+        address pair = t.pair();
+        uint256 first = t.balanceOf(a) / 4;
+        vm.prank(a);
+        t.transfer(pair, first);
+        MiniPair(pair).sync();
+        _roll();
+        t.poke();
+        assertEq(t.hwmNet(), 0, "sync");
+
+        uint256 second = t.balanceOf(a) / 4;
+        vm.prank(a);
+        t.transfer(pair, second);
+        MiniPair(pair).skim(a);
+        _roll();
+        t.poke();
+        assertEq(t.hwmNet(), 0, "skim out");
+    }
+
+    function test_sameBlockRoundTripDoesNotLockGrossBuy() public {
+        FairToken.Params memory p = _params();
+        p.swapThreshold = 1_000_000 ether;
+        FairToken t = _fresh(p);
+        address a = _actor(bytes32("rt"));
+        _fillAndFinalize(t, a);
+        _roll();
+        RoundTrip trip = new RoundTrip();
+        uint256 bought = trip.go{value: 1 ether}(t, router, 1 ether);
+        _roll();
+        t.poke();
+        assertLt(t.hwmNet(), bought, "gross buy");
+        assertLt(t.hwmNet(), bought / 2, "same-block net");
+    }
+
+    function test_realBuyStillRaisesHighWater() public {
+        FairToken.Params memory p = _params();
+        p.swapThreshold = 1_000_000 ether;
+        FairToken t = _fresh(p);
+        address a = _actor(bytes32("buy"));
+        _fillAndFinalize(t, a);
+        _roll();
+        address[] memory path = new address[](2);
+        path[0] = address(wbnb);
+        path[1] = address(t);
+        router.swapExactETHForTokens{value: 1 ether}(0, path, a, block.timestamp);
+        _roll();
+        t.poke();
+        assertGt(t.hwmNet(), 0);
+    }
+
+    function test_partialAutoLpKeepsLeftoversAndReusesThem() public {
+        FairToken.Params memory p = _params();
+        p.swapThreshold = 1 ether;
+        p.minUnit = 1e12;
+        FairToken t = _fresh(p);
+        address a = _actor(bytes32("lp"));
+        _fillAndFinalize(t, a);
+        assertEq(address(t).balance, 0, "pool open holds no BNB");
+        assertGt(MiniPair(t.pair()).balanceOf(t.DEAD()), 0, "LP burned");
+
+        router.setLiquidityUse(5000, 5000);
+        _roll();
+        vm.prank(a);
+        t.claim();
+        address[] memory back = new address[](2);
+        back[0] = address(t);
+        back[1] = address(wbnb);
+        uint256 sellAmt = t.balanceOf(a) / 3;
+        vm.startPrank(a);
+        t.approve(address(router), type(uint256).max);
+        // First sell only accrues tax. Swapback runs on a later sell, before that sell's fee.
+        router.swapExactTokensForETHSupportingFeeOnTransferTokens(sellAmt, 0, back, a, block.timestamp);
+        router.swapExactTokensForETHSupportingFeeOnTransferTokens(sellAmt, 0, back, a, block.timestamp);
+        vm.stopPrank();
+
+        uint256 sellFeeLp = sellAmt * 150 / 10_000;
+        uint256 leftoverTokens = t.taxLpReserve();
+        uint256 leftoverBnb = address(t).balance;
+        assertGt(leftoverTokens, sellFeeLp, "unused LP tokens stay reserved");
+        assertGt(leftoverBnb, 0, "refunded BNB stays for the next add");
+        uint256 devBefore = dev.balance;
+        assertGt(devBefore, 0, "dev half swapped");
+
+        router.setLiquidityUse(10_000, 10_000);
+        uint256 sell2 = t.balanceOf(a) / 2;
+        vm.startPrank(a);
+        router.swapExactTokensForETHSupportingFeeOnTransferTokens(sell2, 0, back, a, block.timestamp);
+        vm.stopPrank();
+
+        assertLt(address(t).balance, leftoverBnb, "prior BNB was reused");
+        assertLt(t.taxLpReserve(), leftoverTokens, "prior tokens were reused");
+        assertEq(address(t).balance, 0);
+        assertGt(dev.balance, devBefore);
+        vm.prank(dev);
+        (bool pulled,) = address(t).call(abi.encodeWithSignature("withdraw()"));
+        assertFalse(pulled);
+    }
+
+    function test_smallSupplyVestCannotClaimUnreleased() public {
+        FairToken.Params memory p = _params();
+        p.hardCap = 8;
+        p.softCap = 4;
+        p.maxPerWallet = 8;
+        p.maxPerIdentity = 8;
+        p.tokensPerShare = 30_000;
+        p.swapThreshold = 1_000_000 ether;
+        FairToken t = _fresh(p);
+        address a = _actor(bytes32("dust"));
+        _fillAndFinalize(t, a);
+        vm.prank(a);
+        t.claim();
+        uint256 held = t.balanceOf(a);
+        _swapOut(t, 2);
+        _roll();
+        t.poke();
+        _swapOut(t, 2);
+        _roll();
+        t.poke();
+        (,, uint256 claimable,) = t.unlockState(a);
+        if (claimable > 0) {
+            vm.prank(a);
+            t.claim();
+        }
+        uint256 vestClaimed = t.balanceOf(a) - held;
+        assertGe(t.vestedOut(), vestClaimed, "claim within released");
+        assertEq(t.pool() + t.vestedOut() + t.burnedLocked() + t.earmark(), t.initialPool());
+        assertGe(t.balanceOf(address(t)), t.pool() + t.earmark());
+    }
+
+    function test_defaultSupplyReleaseMatchesClaim() public {
+        FairToken.Params memory p = _params();
+        p.swapThreshold = 1_000_000 ether;
+        FairToken t = _fresh(p);
+        address a = _actor(bytes32("def"));
+        _fillAndFinalize(t, a);
+        assertGt(t.initialPool(), 1e18, "default points exceed the wad");
+        vm.prank(a);
+        t.claim();
+        uint256 held = t.balanceOf(a);
+        address[] memory path = new address[](2);
+        path[0] = address(wbnb);
+        path[1] = address(t);
+        router.swapExactETHForTokens{value: 1 ether}(0, path, address(this), block.timestamp);
+        _roll();
+        t.poke();
+        (,, uint256 claimable,) = t.unlockState(a);
+        assertGt(claimable, 0);
+        vm.prank(a);
+        t.claim();
+        assertEq(t.balanceOf(a) - held, t.vestedOut());
+    }
+
+    function testFuzz_releaseNeverPaysMoreThanVested(uint256 amountOut) public {
+        amountOut = bound(amountOut, 2, 50_000);
+        FairToken.Params memory p = _params();
+        p.hardCap = 8;
+        p.softCap = 4;
+        p.maxPerWallet = 8;
+        p.maxPerIdentity = 8;
+        p.tokensPerShare = 30_000;
+        p.swapThreshold = 1_000_000 ether;
+        FairToken t = _fresh(p);
+        address a = _actor(bytes32("fuzz"));
+        _fillAndFinalize(t, a);
+        vm.prank(a);
+        t.claim();
+        uint256 held = t.balanceOf(a);
+        _swapOut(t, amountOut);
+        _roll();
+        t.poke();
+        (,, uint256 claimable,) = t.unlockState(a);
+        if (claimable > 0) {
+            vm.prank(a);
+            t.claim();
+        }
+        assertGe(t.vestedOut(), t.balanceOf(a) - held);
+        assertEq(t.pool() + t.vestedOut() + t.burnedLocked() + t.earmark(), t.initialPool());
+    }
+
+    function _roll() internal {
+        vm.roll(block.number + 1);
+    }
+
+    function _swapOut(FairToken t, uint256 amountOut) internal {
+        address pair = t.pair();
+        MiniPair p = MiniPair(pair);
+        bool token0 = p.token0() == address(t);
+        wbnb.deposit{value: 1 ether}();
+        wbnb.transfer(pair, 1 ether);
+        p.swap(token0 ? amountOut : 0, token0 ? 0 : amountOut, address(this), "");
+    }
+
     function test_deployGas() public {
         FairToken.Params memory p = _params();
         uint256 beforeGas = gasleft();

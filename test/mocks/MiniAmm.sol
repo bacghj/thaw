@@ -165,6 +165,10 @@ contract MiniFactory {
 contract MiniRouter {
     address public immutable factory;
     address public immutable WETH;
+    /// @notice Portion of addLiquidityETH inputs that are actually deposited, in bps.
+    ///         10000 matches a router that consumes the full amount. Lower values refund the rest.
+    uint256 public liquidityTokenBps = 10_000;
+    uint256 public liquidityEthBps = 10_000;
 
     constructor(address factory_, address weth_) {
         factory = factory_;
@@ -224,6 +228,12 @@ contract MiniRouter {
         require(ok, "eth");
     }
 
+    function setLiquidityUse(uint256 tokenBps, uint256 ethBps) external {
+        require(tokenBps > 0 && tokenBps <= 10_000 && ethBps > 0 && ethBps <= 10_000, "bps");
+        liquidityTokenBps = tokenBps;
+        liquidityEthBps = ethBps;
+    }
+
     function addLiquidityETH(
         address token,
         uint256 amountTokenDesired,
@@ -233,13 +243,18 @@ contract MiniRouter {
         uint256 deadline
     ) external payable returns (uint256 amountToken, uint256 amountETH, uint256 liquidity) {
         require(deadline >= block.timestamp, "time");
-        MiniWBNB(payable(WETH)).deposit{value: msg.value}();
+        amountToken = amountTokenDesired * liquidityTokenBps / 10_000;
+        amountETH = msg.value * liquidityEthBps / 10_000;
+        require(amountToken > 0 && amountETH > 0, "dust");
+        MiniWBNB(payable(WETH)).deposit{value: amountETH}();
+        if (msg.value > amountETH) {
+            (bool refunded,) = msg.sender.call{value: msg.value - amountETH}("");
+            require(refunded, "refund");
+        }
         address pair = MiniFactory(factory).getPair(token, WETH);
-        require(IERC20Mini(token).transferFrom(msg.sender, pair, amountTokenDesired), "pull");
-        require(MiniWBNB(payable(WETH)).transfer(pair, msg.value), "w");
+        require(IERC20Mini(token).transferFrom(msg.sender, pair, amountToken), "pull");
+        require(MiniWBNB(payable(WETH)).transfer(pair, amountETH), "w");
         liquidity = MiniPair(pair).mint(to);
-        amountToken = amountTokenDesired;
-        amountETH = msg.value;
     }
 
     function _swap(address pair, address[] calldata path, uint256 amountOut, address to) internal {

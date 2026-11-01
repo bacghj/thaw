@@ -63,8 +63,8 @@ contract DeployTestnet is Script {
     }
 
     function _params(address verifier) internal view returns (FairToken.Params memory p) {
-        p.name = vm.envOr("TOKEN_NAME", string("Fair Mint"));
-        p.symbol = vm.envOr("TOKEN_SYMBOL", string("FMT"));
+        p.name = vm.envOr("TOKEN_NAME", string("HIVEN"));
+        p.symbol = vm.envOr("TOKEN_SYMBOL", string("HIVEN"));
         p.verifier = verifier;
         p.devWallet = vm.envOr("DEV_WALLET", TEST_DEV);
         p.router = vm.envOr("ROUTER", TESTNET_ROUTER);

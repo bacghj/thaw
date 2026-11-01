@@ -63,13 +63,15 @@ contract FairInvariantTest is Test {
 
         handler = new FairHandler(token, router, wbnb, actors);
         targetContract(address(handler));
-        bytes4[] memory selectors = new bytes4[](6);
+        bytes4[] memory selectors = new bytes4[](8);
         selectors[0] = handler.claim.selector;
         selectors[1] = handler.poke.selector;
         selectors[2] = handler.warp.selector;
         selectors[3] = handler.transferOut.selector;
         selectors[4] = handler.buy.selector;
         selectors[5] = handler.sell.selector;
+        selectors[6] = handler.skimPairToSelf.selector;
+        selectors[7] = handler.syncPair.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
 
@@ -80,6 +82,7 @@ contract FairInvariantTest is Test {
     function invariant_tokenBalanceMatchesClaims() public view {
         uint256 owed = token.minterSupply() - token.burnedLocked() - token.claimedTotal();
         assertEq(token.balanceOf(address(token)), owed + token.taxDevReserve() + token.taxLpReserve());
+        assertGe(token.balanceOf(address(token)), token.pool() + token.earmark() + token.taxDevReserve() + token.taxLpReserve());
     }
 
     function invariant_supply() public view {
