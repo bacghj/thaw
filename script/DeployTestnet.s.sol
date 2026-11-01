@@ -83,7 +83,10 @@ contract DeployTestnet is Script {
         p.tokensPerShare = vm.envOr("TOKENS_PER_SHARE", uint256(3000 ether));
         p.premiumNum = vm.envOr("PREMIUM_NUM", uint256(3));
         p.premiumDen = vm.envOr("PREMIUM_DEN", uint256(2));
-        p.immediateUnlockBps = uint16(vm.envOr("IMMEDIATE_BPS", uint256(3000)));
+        p.immediateUnlockBps = uint16(vm.envOr("IMMEDIATE_BPS", uint256(1500)));
+        p.mintFeeBps = uint16(vm.envOr("MINT_FEE_BPS", uint256(1000)));
+        p.twapWindow = vm.envOr("TWAP_WINDOW", uint256(30 minutes));
+        p.twapMaxDeviationBps = uint16(vm.envOr("TWAP_MAX_DEVIATION_BPS", uint256(1000)));
         p.demandNum = vm.envOr("DEMAND_NUM", uint256(50));
         p.demandDen = vm.envOr("DEMAND_DEN", uint256(100));
         p.vestCliff = vm.envOr("VEST_CLIFF", uint256(2 minutes));

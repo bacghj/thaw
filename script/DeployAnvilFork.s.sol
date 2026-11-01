@@ -50,7 +50,10 @@ contract DeployAnvilFork is Script {
         p.tokensPerShare = 3000 ether;
         p.premiumNum = 3;
         p.premiumDen = 2;
-        p.immediateUnlockBps = 3000;
+        p.immediateUnlockBps = 1500;
+        p.mintFeeBps = 1000;
+        p.twapWindow = 30 minutes;
+        p.twapMaxDeviationBps = 1000;
         p.demandNum = 50;
         p.demandDen = 100;
         p.vestCliff = 7 days;

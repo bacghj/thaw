@@ -87,7 +87,7 @@ contract FairInvariantTest is Test {
     }
 
     function invariant_supply() public view {
-        assertEq(token.totalSupply(), token.minterSupply() + token.lpMinted() - token.burnedLocked());
+        assertEq(token.totalSupply(), token.minterSupply() + token.openMinted() + token.lpMinted() - token.burnedLocked());
     }
 
     /// @notice Raised BNB left the launch contract at finalize. Trading can move LP BNB;

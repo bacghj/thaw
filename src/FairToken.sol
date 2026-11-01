@@ -14,11 +14,18 @@ import {FullMath} from "./FullMath.sol";
 ///
 /// Finalize (anyone, once the hard cap is filled or the window ended at/above the soft cap):
 /// minters are allocated `sold * tokensPerShare` tokens (constant tokens per share, so cheaper
-/// tiers have a better cost basis). The pair receives `minterSupply * premiumDen / premiumNum`
-/// tokens plus 100% of raised BNB, so the opening price is `premiumNum/premiumDen` times the
-/// average mint cost. LP tokens are minted to the dead address. Liquidity is seeded by transferring
-/// WBNB and tokens straight to the pair and calling `mint` — not `router.addLiquidity` — and donated
-/// reserves are included in the price math so a pre-seeded pair cannot block finalize or move the price.
+/// tiers have a better cost basis). `mintFeeBps` of raised BNB is sent to `devWallet`. The pair
+/// receives the other 90% (by default) plus however many tokens make the opening price
+/// `premiumNum/premiumDen` times the average mint cost of the full raise. LP tokens are minted
+/// to the dead address. Liquidity is seeded by transferring WBNB and tokens straight to the pair
+/// and calling `mint` — not `router.addLiquidity` — and donated reserves are included in the price
+/// math so a pre-seeded pair cannot block finalize or move the price.
+///
+/// After open, unsold shares can still be minted until `hardCap`. The price is `tokensPerShare`
+/// times a Pancake V2 cumulative-price TWAP of at least `twapWindow`, never the spot price.
+/// Same-block swaps add zero seconds to that average. 10% of the BNB goes to `devWallet` and 90%
+/// is paired with new tokens at the current reserve ratio (the add does not move the price) and
+/// the LP is minted to dead. Those tokens are unlocked and are not vesting shares.
 ///
 /// Unlock: `immediateUnlockBps` is claimable at open. The rest vests with demand
 /// (for every `demandDen` tokens of committed net buying, `demandNum` locked tokens unlock)
@@ -41,8 +48,12 @@ contract FairToken {
 
     /// @notice Constructor argument failed a sanity check. `what` names the field.
     error InvalidParams(string what);
-    /// @notice Mint window is closed, refunds are open, or the pool is already live.
+    /// @notice Mint window is closed, refunds are open, or the hard cap is already sold.
     error MintClosed();
+    /// @notice The first TWAP window has not elapsed, so post-open minting is not priced yet.
+    error TwapNotReady();
+    /// @notice Spot price is too far from the TWAP, so the mint is refused.
+    error TwapDeviation();
     /// @notice `msg.value` does not equal the tier quote.
     error WrongPayment(uint256 expected, uint256 actual);
     /// @notice Requested shares exceed the remaining hard cap.
@@ -122,6 +133,9 @@ contract FairToken {
         uint256 forfeitWindow;
         uint256 swapThreshold;
         uint256 minUnit;
+        uint16 mintFeeBps;
+        uint256 twapWindow;
+        uint16 twapMaxDeviationBps;
     }
 
     struct Account {
@@ -203,6 +217,9 @@ contract FairToken {
     uint256 public immutable forfeitWindow;
     uint256 public immutable swapThreshold;
     uint256 public immutable minUnit;
+    uint256 public immutable mintFeeBps;
+    uint256 public immutable twapWindow;
+    uint256 public immutable twapMaxDeviationBps;
 
     // -------------------------------------------------------------------------
     // ERC-20 / launch state. `pair` is written once inside `finalize` from the factory.
@@ -246,6 +263,13 @@ contract FairToken {
     uint256 public earmark;
     uint256 public initialPool;
     uint256 public claimedTotal;
+    /// @notice Tokens minted to post-open buyers. Not part of the vest pool.
+    uint256 public openMinted;
+
+    uint32 public twapOlderTs;
+    uint32 public twapNewerTs;
+    uint256 public twapOlderCum;
+    uint256 public twapNewerCum;
 
     int256 public liveNet;
     uint256 public hwmNet;
@@ -265,6 +289,15 @@ contract FairToken {
     event Transfer(address indexed from, address indexed to, uint256 value);
     event Approval(address indexed owner, address indexed spender, uint256 value);
     event Minted(address indexed user, bytes32 indexed identity, uint256 shares, uint256 paid);
+    event OpenMinted(
+        address indexed user,
+        bytes32 indexed identity,
+        uint256 shares,
+        uint256 paid,
+        uint256 fee,
+        uint256 lpBnb,
+        uint256 lpTokens
+    );
     event RefundTriggered();
     event Refunded(address indexed user, uint256 amount);
     event Finalized(uint256 minterSupply, uint256 lpTokens, uint256 raised, uint256 tokenReserve, uint256 wbnbReserve);
@@ -290,6 +323,7 @@ contract FairToken {
         if (p.vestCliff == 0 || p.vestLinear == 0) revert InvalidParams("vest");
         if (p.forfeitFullRate == 0 || p.forfeitWindow <= p.forfeitFullRate) revert InvalidParams("forfeit window");
         if (p.swapThreshold == 0 || p.minUnit == 0) revert InvalidParams("threshold");
+        if (p.mintFeeBps >= BPS) revert InvalidParams("mint fee");
 
         uint256 maxSupply = p.hardCap * p.tokensPerShare;
         if (p.hardCap != 0 && maxSupply / p.tokensPerShare != p.hardCap) revert InvalidParams("supply overflow");
@@ -334,6 +368,9 @@ contract FairToken {
         forfeitWindow = p.forfeitWindow;
         swapThreshold = p.swapThreshold;
         minUnit = p.minUnit;
+        mintFeeBps = p.mintFeeBps;
+        twapWindow = p.twapWindow == 0 ? 30 minutes : p.twapWindow;
+        twapMaxDeviationBps = p.twapMaxDeviationBps;
     }
 
     modifier nonReentrant() {
@@ -381,8 +418,14 @@ contract FairToken {
     function quote(uint256 shares) external view returns (uint256 bnbCost, uint256 tokensOut) {
         if (shares == 0) return (0, 0);
         if (sold + shares > hardCap) revert CapExceeded(hardCap - sold, shares);
+        if (launched) return _quoteOpen(shares);
         bnbCost = _cost(sold, shares);
         tokensOut = shares * tokensPerShare;
+    }
+
+    /// @notice Post-open price. `bnbCost` is `tokensPerShare * shares` times the TWAP (BNB per token).
+    function quoteOpen(uint256 shares) external view returns (uint256 bnbCost, uint256 tokensOut) {
+        return _quoteOpen(shares);
     }
 
     function unlockState(address account)
@@ -415,6 +458,17 @@ contract FairToken {
         return PREC - (elapsed * PREC) / span;
     }
 
+    function _quoteOpen(uint256 shares) internal view returns (uint256 bnbCost, uint256 tokensOut) {
+        tokensOut = shares * tokensPerShare;
+        uint256 twap = _consultTwap();
+        bnbCost = FullMath.mulDiv(tokensOut, twap, PREC);
+    }
+
+    /// @notice BNB per token from the cumulative-price window. Reverts before the first full window.
+    function twapPrice() public view returns (uint256 wbnbPerTokenWad) {
+        return _consultTwap();
+    }
+
     function spotPrice() public view returns (uint256 wbnbPerTokenWad) {
         if (pair == address(0)) return 0;
         (uint112 r0, uint112 r1,) = IPancakePair(pair).getReserves();
@@ -434,16 +488,22 @@ contract FairToken {
     // Mint / refund / finalize / claim
     // -------------------------------------------------------------------------
 
-    /// @notice Buy `shares` at the current tier quote. `msg.value` must equal `quote`.
+    /// @notice Buy `shares`. Before open, the price is the tier quote. After open, unsold shares
+    ///         cost `tokensPerShare` times the TWAP and are delivered unlocked.
     ///         Rejects contract code unless it is an EIP-7702 delegation designator:
     ///         exactly 23 bytes, prefix 0xef0100, then a 20-byte address.
     function mint(uint256 shares) external payable nonReentrant {
-        if (launched || refundMode || block.timestamp >= deadline) revert MintClosed();
+        if (refundMode) revert MintClosed();
         if (shares == 0) revert ZeroShares();
         _requireEoa(msg.sender);
         (bool ok, bytes32 id) = verifier.verify(msg.sender);
         if (!ok || id == bytes32(0)) revert NotAgent(msg.sender);
+        if (launched) _mintOpen(shares, id);
+        else _mintSubscribe(shares, id);
+    }
 
+    function _mintSubscribe(uint256 shares, bytes32 id) internal {
+        if (block.timestamp >= deadline) revert MintClosed();
         Account storage a = accounts[msg.sender];
         if (a.shares + shares > maxPerWallet) revert WalletCapExceeded(maxPerWallet, a.shares, shares);
         if (idShares[id] + shares > maxPerIdentity) revert IdentityCapExceeded(maxPerIdentity, idShares[id], shares);
@@ -459,6 +519,43 @@ contract FairToken {
         a.paid += msg.value;
         idShares[id] += shares;
         emit Minted(msg.sender, id, shares, msg.value);
+    }
+
+    function _mintOpen(uint256 shares, bytes32 id) internal {
+        if (sold >= hardCap) revert MintClosed();
+        if (sold + shares > hardCap) revert CapExceeded(hardCap - sold, shares);
+        if (idShares[id] + shares > maxPerIdentity) revert IdentityCapExceeded(maxPerIdentity, idShares[id], shares);
+        _observeTwap();
+        uint256 twap = _consultTwap();
+        _checkSpot(twap);
+        uint256 tokensOut = shares * tokensPerShare;
+        uint256 cost = FullMath.mulDiv(tokensOut, twap, PREC);
+        if (cost == 0) revert WrongPayment(1, msg.value);
+        if (msg.value != cost) revert WrongPayment(cost, msg.value);
+
+        sold += shares;
+        idShares[id] += shares;
+        openMinted += tokensOut;
+
+        uint256 fee = msg.value * mintFeeBps / BPS;
+        uint256 lpBnb = msg.value - fee;
+        (uint256 rT, uint256 rW) = _reserves();
+        uint256 tokenAdd = rW == 0 ? 0 : rT * lpBnb / rW;
+        if (lpBnb > 0 && tokenAdd == 0) revert WrongPayment(cost, msg.value);
+        lpMinted += tokenAdd;
+
+        _move(address(0), msg.sender, tokensOut);
+        if (tokenAdd > 0) _move(address(0), pair, tokenAdd);
+        if (lpBnb > 0) {
+            IWBNB(wbnb).deposit{value: lpBnb}();
+            if (!IWBNB(wbnb).transfer(pair, lpBnb)) revert RefundFailed();
+            IPancakePair(pair).mint(DEAD);
+        }
+        if (fee > 0) {
+            (bool sent,) = devWallet.call{value: fee}("");
+            if (!sent) revert RefundFailed();
+        }
+        emit OpenMinted(msg.sender, id, shares, msg.value, fee, lpBnb, tokenAdd);
     }
 
     function triggerRefund() external {
@@ -513,8 +610,12 @@ contract FairToken {
 
         uint256 t0 = balanceOf[p];
         uint256 w0 = IWBNB(wbnb).balanceOf(p);
-        uint256 wAdd = raised;
-        uint256 finalT = FullMath.mulDiv(w0 + wAdd, minterSupply * premiumDen, wAdd * premiumNum);
+        uint256 fee = raised * mintFeeBps / BPS;
+        uint256 wAdd = raised - fee;
+        if (wAdd == 0) revert FinalizeNotReady();
+        // Price target uses the full raise, not the 90% that is paired, so the open
+        // is still premium times the average mint cost.
+        uint256 finalT = FullMath.mulDiv(w0 + wAdd, minterSupply * premiumDen, raised * premiumNum);
         uint256 tAdd = t0 >= finalT ? 0 : finalT - t0;
 
         _move(address(0), address(this), minterSupply);
@@ -524,6 +625,11 @@ contract FairToken {
         IWBNB(wbnb).deposit{value: wAdd}();
         if (!IWBNB(wbnb).transfer(p, wAdd)) revert RefundFailed();
         IPancakePair(p).mint(DEAD);
+        _seedTwap();
+        if (fee > 0) {
+            (bool sent,) = devWallet.call{value: fee}("");
+            if (!sent) revert RefundFailed();
+        }
 
         inFinalize = false;
         emit Finalized(minterSupply, tAdd, wAdd, balanceOf[p], IWBNB(wbnb).balanceOf(p));
@@ -737,6 +843,7 @@ contract FairToken {
 
     function _checkpoint() internal {
         if (!launched) return;
+        _observeTwap();
         if (block.number > lastCommitBlock) {
             if (liveNet > 0 && uint256(liveNet) > hwmNet) hwmNet = uint256(liveNet);
             lastCommitBlock = block.number;
@@ -1132,6 +1239,73 @@ contract FairToken {
     // -------------------------------------------------------------------------
     // Quotes / gates
     // -------------------------------------------------------------------------
+
+    function _reserves() internal view returns (uint256 tokenReserve, uint256 wbnbReserve) {
+        (uint112 r0, uint112 r1,) = IPancakePair(pair).getReserves();
+        bool tokenIs0 = IPancakePair(pair).token0() == address(this);
+        tokenReserve = tokenIs0 ? uint256(r0) : uint256(r1);
+        wbnbReserve = tokenIs0 ? uint256(r1) : uint256(r0);
+    }
+
+    /// @dev Pancake cumulative for "WBNB per token", extrapolated to this timestamp with the
+    ///      reserves already stored on the pair. A swap in this block updates the pair first,
+    ///      so the new reserves contribute zero seconds.
+    function _currentCumulative() internal view returns (uint256 cum, uint32 ts) {
+        ts = uint32(block.timestamp);
+        bool tokenIs0 = IPancakePair(pair).token0() == address(this);
+        cum = tokenIs0 ? IPancakePair(pair).price0CumulativeLast() : IPancakePair(pair).price1CumulativeLast();
+        (uint112 r0, uint112 r1, uint32 last) = IPancakePair(pair).getReserves();
+        if (ts > last && r0 != 0 && r1 != 0) {
+            uint256 priceX112 = tokenIs0 ? (uint256(r1) << 112) / r0 : (uint256(r0) << 112) / r1;
+            cum += priceX112 * (ts - last);
+        }
+    }
+
+    function _seedTwap() internal {
+        (uint256 cum, uint32 ts) = _currentCumulative();
+        twapOlderTs = ts;
+        twapNewerTs = ts;
+        twapOlderCum = cum;
+        twapNewerCum = cum;
+    }
+
+    function _observeTwap() internal {
+        if (pair == address(0)) return;
+        (uint256 cum, uint32 ts) = _currentCumulative();
+        if (twapNewerTs == 0) {
+            twapOlderTs = ts;
+            twapNewerTs = ts;
+            twapOlderCum = cum;
+            twapNewerCum = cum;
+            return;
+        }
+        if (ts == twapNewerTs) return;
+        if (twapNewerTs >= twapOlderTs + twapWindow) {
+            twapOlderTs = twapNewerTs;
+            twapOlderCum = twapNewerCum;
+        }
+        twapNewerTs = ts;
+        twapNewerCum = cum;
+    }
+
+    function _consultTwap() internal view returns (uint256 bnbPerToken) {
+        if (twapOlderTs == 0 || block.timestamp < openTime + twapWindow) revert TwapNotReady();
+        (uint256 cum, uint32 ts) = _currentCumulative();
+        if (ts <= twapOlderTs) revert TwapNotReady();
+        uint32 elapsed = ts - twapOlderTs;
+        if (elapsed < twapWindow) revert TwapNotReady();
+        uint256 avgX112 = (cum - twapOlderCum) / elapsed;
+        bnbPerToken = (avgX112 * PREC) >> 112;
+        if (bnbPerToken == 0) revert TwapNotReady();
+    }
+
+    function _checkSpot(uint256 twap) internal view {
+        if (twapMaxDeviationBps >= BPS) return;
+        uint256 spot = spotPrice();
+        if (spot == 0) revert TwapNotReady();
+        uint256 diff = spot > twap ? spot - twap : twap - spot;
+        if (FullMath.mulDiv(diff, BPS, twap) > twapMaxDeviationBps) revert TwapDeviation();
+    }
 
     function _cost(uint256 cursor, uint256 shares) internal view returns (uint256 cost) {
         uint256 left = shares;

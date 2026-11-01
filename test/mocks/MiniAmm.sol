@@ -50,6 +50,8 @@ contract MiniPair {
     uint112 private reserve0;
     uint112 private reserve1;
     uint32 private blockTimestampLast;
+    uint256 public price0CumulativeLast;
+    uint256 public price1CumulativeLast;
     uint256 public totalSupply;
     mapping(address => uint256) public balanceOf;
     uint256 private unlocked = 1;
@@ -123,9 +125,16 @@ contract MiniPair {
     }
 
     function _update(uint256 bal0, uint256 bal1) internal {
+        uint32 ts = uint32(block.timestamp);
+        if (ts > blockTimestampLast && reserve0 != 0 && reserve1 != 0) {
+            uint32 elapsed = ts - blockTimestampLast;
+            // UQ112x112 price, same accumulator Pancake V2 writes on every reserve update.
+            price0CumulativeLast += ((uint256(reserve1) << 112) / reserve0) * elapsed;
+            price1CumulativeLast += ((uint256(reserve0) << 112) / reserve1) * elapsed;
+        }
         reserve0 = uint112(bal0);
         reserve1 = uint112(bal1);
-        blockTimestampLast = uint32(block.timestamp);
+        blockTimestampLast = ts;
     }
 
     function _safe(address token, address to, uint256 value) internal {
