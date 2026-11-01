@@ -927,7 +927,22 @@ contract FairToken {
         // `vestGrantedOf` is the historical total and is not reduced below.
         _crystallize(user);
         uint256 pointsRemove = amt == locked ? a.points : a.points * amt / locked;
-        if (pointsRemove == 0) return 0;
+        if (pointsRemove == 0) {
+            // The forfeit is smaller than one point of the pool. Rounding the
+            // deduction up would drop a whole point and over-forfeit. The token
+            // amount is still removed from what this holder can claim.
+            a.forfeitedOut += amt;
+            if (a.points == totalPoints) {
+                // Sole holder: taking the tokens out of the pool is their entire loss.
+                pool -= amt;
+                earmark += amt;
+            } else {
+                // Shared pool: do not socialize the cut. Charge it against later vest.
+                a.vestDebt += amt;
+            }
+            parked = amt;
+            return parked;
+        }
         a.points -= pointsRemove;
         totalPoints -= pointsRemove;
         pool -= amt;

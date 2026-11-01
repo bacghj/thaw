@@ -26,6 +26,7 @@ contract EntitlementOracle is Test {
         uint256 vestFair;
         uint256 redist;
         uint256 forfeited;
+        uint256 futureSlash;
     }
 
     FairToken public token;
@@ -35,6 +36,7 @@ contract EntitlementOracle is Test {
     uint256 public lastAccF;
     uint256 public releases;
     uint256 public forfeits;
+    uint256 public lastPool;
 
     constructor(FairToken token_, address[] memory actors_) {
         token = token_;
@@ -45,6 +47,7 @@ contract EntitlementOracle is Test {
         }
         lastAcc = token.accVest();
         lastAccF = token.accForfeit();
+        lastPool = token.pool();
     }
 
     function actorLength() external view returns (uint256) {
@@ -60,20 +63,35 @@ contract EntitlementOracle is Test {
         for (uint256 i; i < n; ++i) {
             address a = actors[i];
             Holder storage h = shadow[a];
-            (,,,,,,,,, uint256 forfeitedOut,,) = token.accounts(a);
+            (,,,,,,,,, uint256 forfeitedOut, uint256 forfeitDust,) = token.accounts(a);
+            uint256 ptsNow = _points(a);
             if (forfeitedOut > h.forfeited) {
+                uint256 delta = forfeitedOut - h.forfeited;
                 forfeits += 1;
+                // Point math could not move. The tokens stayed in the shared pool and
+                // were charged to later vest instead. Take that charge out of the
+                // next index credit. A sole-holder cut shrinks the pool first, so the
+                // index never sees those tokens and must not be cut again.
+                if (ptsNow >= h.points && token.pool() >= lastPool) h.futureSlash += delta;
                 h.forfeited = forfeitedOut;
             }
-            h.points = _points(a);
+            assertEq(forfeitDust / PREC, 0, "forfeit not applied");
+            h.points = ptsNow;
         }
+        lastPool = token.pool();
         if (acc != lastAcc) {
             releases += 1;
             for (uint256 i; i < n; ++i) {
                 Holder storage h = shadow[actors[i]];
                 uint256 credit = h.points * acc / PREC;
                 uint256 prev = h.points * lastAcc / PREC;
-                if (credit > prev) h.vestFair += credit - prev;
+                uint256 add = credit > prev ? credit - prev : 0;
+                if (add > 0 && h.futureSlash > 0) {
+                    uint256 cut = add > h.futureSlash ? h.futureSlash : add;
+                    add -= cut;
+                    h.futureSlash -= cut;
+                }
+                h.vestFair += add;
             }
             lastAcc = acc;
         }

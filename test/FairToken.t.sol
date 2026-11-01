@@ -885,6 +885,160 @@ contract FairTokenTest is Test {
         assertFalse(pulled);
     }
 
+    /// @notice Default params. A is left on a few vest points while everyone else exits,
+    ///         so later forfeits land on a huge token balance and a tiny point balance.
+    ///         The point deduction rounds to 0. That forfeit must still not be claimable.
+    function test_tinyPointsCannotSkipLargeForfeit() public {
+        FairToken.Params memory p = _params();
+        p.hardCap = 30_000;
+        p.softCap = 1_000;
+        p.maxPerWallet = 5;
+        p.maxPerIdentity = 5;
+        p.tokensPerShare = 3000 ether;
+        p.minUnit = 1;
+        p.swapThreshold = 1_000_000 ether;
+        FairToken t = _fresh(p);
+
+        address[] memory holders = new address[](200);
+        holders[0] = _actor(bytes32("tiny-A"));
+        address a = holders[0];
+        _mint(t, a, 5);
+        for (uint256 i = 1; i < 200; ++i) {
+            holders[i] = _actor(bytes32(uint256(0x1000) + i));
+            _mint(t, holders[i], 5);
+        }
+        vm.warp(t.deadline() + 1);
+        t.finalize();
+
+        vm.prank(a);
+        t.claim();
+        uint256 almost = t.balanceOf(a) - 1;
+        vm.prank(a);
+        t.transfer(makeAddr("sink-a"), almost);
+        (,, uint256 pointsA,,,,,,,,,) = t.accounts(a);
+        assertGt(pointsA, 0, "A keeps a point residue");
+        assertLt(pointsA, 10, "residue is only a few points");
+
+        for (uint256 i = 1; i < 200; ++i) {
+            vm.prank(holders[i]);
+            t.claim();
+            uint256 bal = t.balanceOf(holders[i]);
+            if (bal > 0) {
+                vm.prank(holders[i]);
+                t.transfer(makeAddr("sink-rest"), bal);
+            }
+        }
+        assertEq(t.totalPoints(), pointsA, "everyone else left the vest");
+
+        vm.warp(t.openTime() + 10.5 days);
+        t.poke();
+        vm.prank(a);
+        t.claim();
+        uint256 mid = t.balanceOf(a);
+        assertGt(mid, 500_000 ether, "day 10.5 vest is about half the pool");
+
+        (uint256 lockedBefore,,,) = t.unlockState(a);
+        (,,,,,,,,, uint256 forfeitedBefore,,) = t.accounts(a);
+        uint256 rate = t.forfeitRateAt(block.timestamp);
+        uint256 expectForfeit = lockedBefore * rate / PREC;
+        assertGt(expectForfeit, 200_000 ether, "legitimate forfeit is hundreds of thousands");
+
+        vm.prank(a);
+        t.transfer(makeAddr("sink-mid"), mid);
+        (,,,,,,,,, uint256 forfeitedAfter,,) = t.accounts(a);
+        uint256 applied = forfeitedAfter - forfeitedBefore;
+        assertEq(_forfeitWei(t, a), 0, "no whole-wei forfeit left pending");
+        assertApproxEqAbs(applied, expectForfeit, 1000, "forfeit applied");
+        assertGt(applied, 200_000 ether, "hundreds of thousands were actually forfeited");
+
+        vm.warp(t.openTime() + 14 days);
+        t.poke();
+        vm.prank(a);
+        t.claim();
+        uint256 second = t.balanceOf(a);
+        // Before the fix this claim was the whole remaining lock, forfeit included.
+        assertEq(second + applied, lockedBefore, "forfeit is not claimable at day 14");
+        assertApproxEqAbs(second, lockedBefore - expectForfeit, 1000, "day-14 claim is the unforfeited remainder");
+        assertEq(_forfeitWei(t, a), 0, "day-14 claim did not revive a pending forfeit");
+        assertEq(t.pool() + t.vestedOut() + t.burnedLocked() + t.earmark(), t.initialPool());
+    }
+
+    /// @notice Tiny residual points, large token forfeit. The oracle must reject a forfeit
+    ///         that was computed and then left claimable.
+    function testFuzz_tinyPointLargeForfeit(uint8 extraHolders, uint256 salt) public {
+        extraHolders = uint8(bound(extraHolders, 1, 4));
+        uint256 n = uint256(extraHolders) + 1;
+        FairToken.Params memory p = _params();
+        p.hardCap = n * 2;
+        p.softCap = 2;
+        p.maxPerWallet = 2;
+        p.maxPerIdentity = 2;
+        p.tokensPerShare = 3000 ether;
+        p.minUnit = 1;
+        p.swapThreshold = 1_000_000 ether;
+        FairToken t = _fresh(p);
+        address[] memory holders = new address[](n);
+        for (uint256 i; i < n; ++i) {
+            holders[i] = _actor(keccak256(abi.encode(salt, i)));
+            _mint(t, holders[i], 2);
+        }
+        t.finalize();
+        EntitlementOracle oracle = new EntitlementOracle(t, holders);
+        address a = holders[0];
+        vm.prank(a);
+        t.claim();
+        oracle.sync();
+        uint256 keep = t.balanceOf(a);
+        vm.prank(a);
+        t.transfer(makeAddr("fuzz-trim"), keep - 1);
+        oracle.sync();
+        oracle.check();
+        for (uint256 i = 1; i < n; ++i) {
+            vm.prank(holders[i]);
+            t.claim();
+            uint256 bal = t.balanceOf(holders[i]);
+            if (bal > 0) {
+                vm.prank(holders[i]);
+                t.transfer(makeAddr("fuzz-exit"), bal);
+            }
+            oracle.sync();
+            oracle.check();
+        }
+        vm.warp(t.openTime() + 10.5 days);
+        t.poke();
+        oracle.sync();
+        oracle.check();
+        vm.prank(a);
+        t.claim();
+        oracle.sync();
+        uint256 mid = t.balanceOf(a);
+        (uint256 lockedBefore,,,) = t.unlockState(a);
+        if (mid > 0) {
+            vm.prank(a);
+            t.transfer(makeAddr("fuzz-mid"), mid);
+        }
+        oracle.sync();
+        oracle.check();
+        assertEq(_forfeitWei(t, a), 0, "forfeit not applied");
+        vm.warp(t.openTime() + 14 days);
+        t.poke();
+        oracle.sync();
+        oracle.check();
+        vm.prank(a);
+        try t.claim() {} catch {}
+        oracle.sync();
+        oracle.check();
+        if (lockedBefore > 0 && mid > 0) {
+            assertLt(t.balanceOf(a), lockedBefore, "residual points kept a large forfeit");
+        }
+        assertEq(t.pool() + t.vestedOut() + t.burnedLocked() + t.earmark(), t.initialPool());
+    }
+
+    function _forfeitWei(FairToken t, address a) internal view returns (uint256 weiDust) {
+        (,,,,,,,,,, uint256 dust,) = t.accounts(a);
+        return dust / PREC;
+    }
+
     /// @notice Default-size supply. After a partial vest, A moves the whole liquid balance.
     ///         The forfeit should come only out of what is still locked. Day 14 must still
     ///         pay the locked remainder. Keeping the pre-forfeit debt drops that remainder
