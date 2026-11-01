@@ -154,6 +154,8 @@ abstract contract FairTokenBase {
     ///      matches the integer reference model. Above it, vest and forfeit use global
     ///      indices and never touch another holder's storage.
     uint256 internal constant EXACT_MAX = 6;
+    /// @dev Ring size for TWAP checkpoints (see `_observeTwap`).
+    uint256 internal constant TWAP_SLOTS = 4;
     address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
 
     // -------------------------------------------------------------------------
@@ -252,10 +254,11 @@ abstract contract FairTokenBase {
     /// @notice Tokens minted to post-open buyers. Not part of the vest pool.
     uint256 public openMinted;
 
-    uint32 public twapOlderTs;
-    uint32 public twapNewerTs;
-    uint256 public twapOlderCum;
-    uint256 public twapNewerCum;
+    /// @notice TWAP checkpoints: a ring of `TWAP_SLOTS` Pancake cumulative prices. A new one is
+    ///         written at most once per `ceil(twapWindow / 2)`; `twapObsHead` is the newest slot.
+    uint32[4] public twapObsTs;
+    uint256[4] public twapObsCum;
+    uint256 public twapObsHead;
 
     int256 public liveNet;
     uint256 public hwmNet;
@@ -349,6 +352,8 @@ abstract contract FairTokenBase {
     // Internal logic (shared)
     // -------------------------------------------------------------------------
 
+    /// @dev Same price `_mintOpen` charges in this block: both read `_consultTwap` before any
+    ///      checkpoint is written, and a checkpoint written in this block is never the reference.
     function _quoteOpen(uint256 shares) internal view returns (uint256 bnbCost, uint256 tokensOut) {
         tokensOut = shares * tokensPerShare;
         uint256 twap = _consultTwap();
@@ -359,20 +364,22 @@ abstract contract FairTokenBase {
         if (sold >= hardCap) revert MintClosed();
         if (sold + shares > hardCap) revert CapExceeded(hardCap - sold, shares);
         if (idShares[id] + shares > maxPerIdentity) revert IdentityCapExceeded(maxPerIdentity, idShares[id], shares);
-        _observeTwap();
         uint256 twap = _consultTwap();
         _checkSpot(twap);
+        _observeTwap();
         uint256 tokensOut = shares * tokensPerShare;
         uint256 cost = FullMath.mulDiv(tokensOut, twap, PREC);
         if (cost == 0) revert WrongPayment(1, msg.value);
-        if (msg.value != cost) revert WrongPayment(cost, msg.value);
+        // msg.value is the buyer's price cap: anything above `cost` is refunded at the end.
+        if (msg.value < cost) revert WrongPayment(cost, msg.value);
+        uint256 excess = msg.value - cost;
 
         sold += shares;
         idShares[id] += shares;
         openMinted += tokensOut;
 
-        uint256 fee = msg.value * mintFeeBps / BPS;
-        uint256 lpBnb = msg.value - fee;
+        uint256 fee = cost * mintFeeBps / BPS;
+        uint256 lpBnb = cost - fee;
         (uint256 rT, uint256 rW) = _reserves();
         uint256 tokenAdd = rW == 0 ? 0 : rT * lpBnb / rW;
         if (lpBnb > 0 && tokenAdd == 0) revert WrongPayment(cost, msg.value);
@@ -390,7 +397,12 @@ abstract contract FairTokenBase {
             (bool sent,) = devWallet.call{value: fee}("");
             if (!sent) revert RefundFailed();
         }
-        emit OpenMinted(msg.sender, id, shares, msg.value, fee, lpBnb, tokenAdd);
+        emit OpenMinted(msg.sender, id, shares, cost, fee, lpBnb, tokenAdd);
+        // Refund last (all state is final; the caller still holds the reentrancy lock).
+        if (excess > 0) {
+            (bool back,) = msg.sender.call{value: excess}("");
+            if (!back) revert RefundFailed();
+        }
     }
 
     function _move(address from, address to, uint256 value) internal {
@@ -1108,42 +1120,53 @@ abstract contract FairTokenBase {
         }
     }
 
+    // TWAP design. `_observeTwap` runs on every launched transfer/poke/mint but writes a
+    // checkpoint only if the newest one is at least `ceil(twapWindow/2)` old, so it costs one
+    // SLOAD pair most of the time and at most one ring write (O(1)). `_consultTwap` averages
+    // from the NEWEST checkpoint that is at least `twapWindow` old. With 4 slots spaced at
+    // least `ceil(twapWindow/2)` apart, the third-newest checkpoint is always >= twapWindow
+    // old, so frequent activity can never leave only too-recent references. Under steady
+    // activity the averaging span is between twapWindow and ~1.5 * twapWindow. If the token
+    // went quiet the span is longer (still a pure on-chain cumulative average); the spot
+    // deviation check in `_checkSpot` rejects a mint when that average is stale versus spot.
+    // A one-block price push counts only for the seconds it stays in the pair's reserves.
+
     function _seedTwap() internal {
         (uint256 cum, uint32 ts) = _currentCumulative();
-        twapOlderTs = ts;
-        twapNewerTs = ts;
-        twapOlderCum = cum;
-        twapNewerCum = cum;
+        twapObsTs[0] = ts;
+        twapObsCum[0] = cum;
+        twapObsHead = 0;
     }
 
     function _observeTwap() internal {
         if (pair == address(0)) return;
+        uint256 h = twapObsHead;
+        uint256 last = twapObsTs[h];
+        if (last == 0) return _seedTwap();
+        if (block.timestamp < last + (twapWindow + 1) / 2) return;
         (uint256 cum, uint32 ts) = _currentCumulative();
-        if (twapNewerTs == 0) {
-            twapOlderTs = ts;
-            twapNewerTs = ts;
-            twapOlderCum = cum;
-            twapNewerCum = cum;
-            return;
-        }
-        if (ts == twapNewerTs) return;
-        if (twapNewerTs >= twapOlderTs + twapWindow) {
-            twapOlderTs = twapNewerTs;
-            twapOlderCum = twapNewerCum;
-        }
-        twapNewerTs = ts;
-        twapNewerCum = cum;
+        h = (h + 1) % TWAP_SLOTS;
+        twapObsTs[h] = ts;
+        twapObsCum[h] = cum;
+        twapObsHead = h;
     }
 
     function _consultTwap() internal view returns (uint256 bnbPerToken) {
-        if (twapOlderTs == 0 || block.timestamp < openTime + twapWindow) revert TwapNotReady();
-        (uint256 cum, uint32 ts) = _currentCumulative();
-        if (ts <= twapOlderTs) revert TwapNotReady();
-        uint32 elapsed = ts - twapOlderTs;
-        if (elapsed < twapWindow) revert TwapNotReady();
-        uint256 avgX112 = (cum - twapOlderCum) / elapsed;
-        bnbPerToken = (avgX112 * PREC) >> 112;
-        if (bnbPerToken == 0) revert TwapNotReady();
+        if (block.timestamp < openTime + twapWindow) revert TwapNotReady();
+        uint256 h = twapObsHead;
+        for (uint256 i; i < TWAP_SLOTS; ++i) {
+            uint256 t0 = twapObsTs[h];
+            if (t0 == 0) break;
+            if (block.timestamp >= t0 + twapWindow) {
+                (uint256 cum, uint32 ts) = _currentCumulative();
+                uint256 avgX112 = (cum - twapObsCum[h]) / (ts - t0);
+                bnbPerToken = (avgX112 * PREC) >> 112;
+                if (bnbPerToken == 0) revert TwapNotReady();
+                return bnbPerToken;
+            }
+            h = (h + TWAP_SLOTS - 1) % TWAP_SLOTS;
+        }
+        revert TwapNotReady();
     }
 
     function _checkSpot(uint256 twap) internal view {

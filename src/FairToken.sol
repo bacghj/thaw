@@ -25,7 +25,10 @@ import {FullMath} from "./FullMath.sol";
 ///
 /// After open, unsold shares can still be minted until `hardCap`. The price is `tokensPerShare`
 /// times a Pancake V2 cumulative-price TWAP of at least `twapWindow`, never the spot price.
-/// Same-block swaps add zero seconds to that average. 10% of the BNB goes to `devWallet` and 90%
+/// Same-block swaps add zero seconds to that average. The reference point is the newest of four
+/// ring checkpoints (written at most once per half window) that is at least `twapWindow` old,
+/// so frequent transfers cannot starve it. The buyer may overpay; only the TWAP cost is used
+/// and the excess is refunded in the same call. 10% of the BNB goes to `devWallet` and 90%
 /// is paired with new tokens at the current reserve ratio (the add does not move the price) and
 /// the LP is minted to dead. Those tokens are unlocked and are not vesting shares.
 ///
@@ -168,6 +171,7 @@ contract FairToken is FairTokenBase {
     }
 
     /// @notice Post-open price. `bnbCost` is `tokensPerShare * shares` times the TWAP (BNB per token).
+    ///         Exactly what a post-open `mint` in the same block charges.
     function quoteOpen(uint256 shares) external view returns (uint256 bnbCost, uint256 tokensOut) {
         return _quoteOpen(shares);
     }
@@ -242,7 +246,8 @@ contract FairToken is FairTokenBase {
     }
 
     /// @notice Buy `shares`. Before open, the price is the tier quote. After open, unsold shares
-    ///         cost `tokensPerShare` times the TWAP and are delivered unlocked.
+    ///         cost `tokensPerShare` times the TWAP and are delivered unlocked. Post-open,
+    ///         `msg.value` is a price cap: it must be >= the cost and the excess is refunded.
     ///         Rejects contract code unless it is an EIP-7702 delegation designator:
     ///         exactly 23 bytes, prefix 0xef0100, then a 20-byte address.
     function mint(uint256 shares) external payable nonReentrant {
