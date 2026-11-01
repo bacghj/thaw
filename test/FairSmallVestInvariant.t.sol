@@ -11,12 +11,16 @@ import {MiniFactory, MiniPair, MiniRouter, MiniWBNB} from "./mocks/MiniAmm.sol";
 
 contract SmallVestHandler is CommonBase, StdCheats, StdUtils {
     FairToken public token;
+    MiniRouter public router;
     MiniWBNB public wbnb;
     address[] public actors;
+    address public sink;
 
-    constructor(FairToken token_, MiniWBNB wbnb_, address[] memory actors_) {
+    constructor(FairToken token_, MiniRouter router_, MiniWBNB wbnb_, address[] memory actors_) {
         token = token_;
+        router = router_;
         wbnb = wbnb_;
+        sink = address(0x5151);
         for (uint256 i; i < actors_.length; ++i) actors.push(actors_[i]);
     }
 
@@ -34,6 +38,12 @@ contract SmallVestHandler is CommonBase, StdCheats, StdUtils {
         token.claim();
     }
 
+    function warp(uint256 dt) external {
+        dt = bound(dt, 1 hours, 2 days);
+        vm.warp(block.timestamp + dt);
+        vm.roll(block.number + 1);
+    }
+
     function tinyBuy(uint256 amountOut) external {
         amountOut = bound(amountOut, 1, 40);
         address pair = token.pair();
@@ -43,8 +53,37 @@ contract SmallVestHandler is CommonBase, StdCheats, StdUtils {
         uint256 reserveOut = token0 ? uint256(r0) : uint256(r1);
         if (amountOut == 0 || amountOut >= reserveOut) return;
         wbnb.deposit{value: 0.01 ether}();
-        wbnb.transfer(pair, 0.01 ether);
+        require(wbnb.transfer(pair, 0.01 ether), "w");
         p.swap(token0 ? amountOut : 0, token0 ? 0 : amountOut, address(this), "");
+    }
+
+    /// @dev Transfer claimed tokens to a non-minter. Inside the forfeit window this parks locked tokens.
+    function transferToOutsider(uint256 i, uint256 pct) external {
+        address a = actors[i % actors.length];
+        uint256 bal = token.balanceOf(a);
+        if (bal == 0) return;
+        pct = bound(pct, 1, 100);
+        uint256 amt = bal * pct / 100;
+        if (amt == 0) amt = 1;
+        if (amt > bal) return;
+        vm.prank(a);
+        token.transfer(sink, amt);
+    }
+
+    function sell(uint256 i, uint256 pct) external {
+        address a = actors[i % actors.length];
+        uint256 bal = token.balanceOf(a);
+        if (bal < 2) return;
+        pct = bound(pct, 1, 80);
+        uint256 amt = bal * pct / 100;
+        if (amt == 0) return;
+        address[] memory path = new address[](2);
+        path[0] = address(token);
+        path[1] = address(wbnb);
+        vm.startPrank(a);
+        token.approve(address(router), amt);
+        router.swapExactTokensForETHSupportingFeeOnTransferTokens(amt, 0, path, a, block.timestamp);
+        vm.stopPrank();
     }
 }
 
@@ -102,13 +141,16 @@ contract FairSmallVestInvariantTest is Test {
         }
         token.finalize();
 
-        handler = new SmallVestHandler(token, wbnb, actors);
+        handler = new SmallVestHandler(token, router, wbnb, actors);
         vm.deal(address(handler), 100 ether);
         targetContract(address(handler));
-        bytes4[] memory selectors = new bytes4[](3);
+        bytes4[] memory selectors = new bytes4[](6);
         selectors[0] = handler.poke.selector;
         selectors[1] = handler.claim.selector;
         selectors[2] = handler.tinyBuy.selector;
+        selectors[3] = handler.transferToOutsider.selector;
+        selectors[4] = handler.sell.selector;
+        selectors[5] = handler.warp.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
 
@@ -122,6 +164,19 @@ contract FairSmallVestInvariantTest is Test {
             sum += pts * token.accVest() / 1e18;
         }
         assertLe(sum, token.vestedOut());
+        uint256 payout;
+        uint256 entitlement;
+        for (uint256 i; i < n; ++i) {
+            address a = handler.actors(i);
+            (uint256 shares,,, uint256 vestDebt,, uint256 claimable,,, uint256 claimed,,,) = token.accounts(a);
+            payout += claimed + claimable;
+            entitlement += shares * token.immediatePerShare();
+            // `claimed` is only immediate unlock plus vest copied into claimable.
+            // Forfeited lock is not an extra payout, and market buys are not in `claimed`.
+            assertLe(claimed, shares * token.immediatePerShare() + vestDebt);
+        }
+        assertLe(payout, entitlement + token.vestedOut());
+        assertLe(token.vestAssigned(), token.vestedOut());
         assertGe(
             token.balanceOf(address(token)),
             token.pool() + token.earmark() + token.taxDevReserve() + token.taxLpReserve()

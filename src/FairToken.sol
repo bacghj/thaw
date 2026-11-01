@@ -227,6 +227,9 @@ contract FairToken {
     uint256 public accVest;
     uint256 public accForfeit;
     uint256 public vestedOut;
+    /// @notice Vest tokens already copied into some account's `claimable`. Always <= `vestedOut`.
+    ///         The gap `vestedOut - vestAssigned` is unallocated dust and stays in the pool's favour.
+    uint256 public vestAssigned;
     uint256 public burnedLocked;
     uint256 public earmark;
     uint256 public initialPool;
@@ -382,6 +385,8 @@ contract FairToken {
         if (pts > 0) {
             uint256 got = pts * acc / PREC;
             if (got > a.vestDebt) pending = got - a.vestDebt;
+            uint256 room = vestedOut > vestAssigned ? vestedOut - vestAssigned : 0;
+            if (pending > room) pending = room;
         }
         claimable = a.claimable + pending;
         if (launched && a.shares > 0 && !a.materialized) claimable += a.shares * immediatePerShare;
@@ -837,11 +842,21 @@ contract FairToken {
         Account storage a = accounts[user];
         if (a.points == 0 && a.vestDebt == 0 && a.forfeitDebt == 0) return;
         uint256 vAcc = a.points * accVest / PREC;
-        if (vAcc > a.vestDebt) a.claimable += vAcc - a.vestDebt;
-        a.vestDebt = vAcc;
+        if (vAcc > a.vestDebt) {
+            uint256 gain = vAcc - a.vestDebt;
+            uint256 room = vestedOut > vestAssigned ? vestedOut - vestAssigned : 0;
+            if (gain > room) gain = room;
+            if (gain > 0) {
+                a.claimable += gain;
+                vestAssigned += gain;
+                a.vestDebt += gain;
+            }
+        }
         uint256 fAcc = a.points * accForfeit / PREC;
-        if (fAcc > a.forfeitDebt) a.forfeitedReceived += fAcc - a.forfeitDebt;
-        a.forfeitDebt = fAcc;
+        if (fAcc > a.forfeitDebt) {
+            a.forfeitedReceived += fAcc - a.forfeitDebt;
+            a.forfeitDebt = fAcc;
+        }
     }
 
     function _lockedOf(address user) internal view returns (uint256) {
@@ -904,13 +919,14 @@ contract FairToken {
         if (amt == 0 || locked == 0 || a.points == 0 || totalPoints == 0) return 0;
         if (amt > locked) amt = locked;
         if (amt == 0) return 0;
+        // Claim rights already copied into `claimable` must stay in `vestDebt`.
+        // Resetting the debt to the post-forfeit index pays that same vest again.
+        _crystallize(user);
         uint256 pointsRemove = amt == locked ? a.points : a.points * amt / locked;
         if (pointsRemove == 0) return 0;
         a.points -= pointsRemove;
         totalPoints -= pointsRemove;
         pool -= amt;
-        a.vestDebt = a.points * accVest / PREC;
-        a.forfeitDebt = a.points * accForfeit / PREC;
         a.forfeitedOut += amt;
         earmark += amt;
         parked = amt;

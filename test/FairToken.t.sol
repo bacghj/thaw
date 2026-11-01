@@ -884,6 +884,49 @@ contract FairTokenTest is Test {
         assertFalse(pulled);
     }
 
+    /// @notice Buy 10, A transfers 12_006 inside the full-forfeit window, buy 2.
+    ///         Released total is 3; the debt reset lets A and B claim 4.
+    function test_forfeitBetweenDustReleasesCannotOverclaim() public {
+        FairToken.Params memory p = _params();
+        p.hardCap = 8;
+        p.softCap = 4;
+        p.maxPerWallet = 4;
+        p.maxPerIdentity = 4;
+        p.tokensPerShare = 30_000;
+        p.minUnit = 1;
+        p.swapThreshold = 1_000_000 ether;
+        FairToken t = _fresh(p);
+        address a = _actor(bytes32("A"));
+        address b = _actor(bytes32("B"));
+        _mint(t, a, 4);
+        _mint(t, b, 4);
+        t.finalize();
+        vm.prank(a);
+        t.claim();
+        vm.prank(b);
+        t.claim();
+
+        _swapOut(t, 10);
+        _roll();
+        t.poke();
+        uint256 amt = 12_006;
+        vm.prank(a);
+        t.transfer(makeAddr("outsider"), amt);
+        _swapOut(t, 2);
+        _roll();
+        t.poke();
+
+        vm.prank(a);
+        try t.claim() {} catch {}
+        vm.prank(b);
+        try t.claim() {} catch {}
+
+        uint256 immediate = 4 * t.immediatePerShare() * 2;
+        uint256 vestPaid = t.claimedTotal() - immediate;
+        assertLe(vestPaid, t.vestedOut(), "A+B vest claims within released");
+        assertGe(t.balanceOf(address(t)), t.pool() + t.earmark() + t.taxDevReserve() + t.taxLpReserve());
+    }
+
     /// @notice Reviewer counterexample: buy 6 wei, poke, buy 2 wei, poke.
     ///         The old index releases 2 and lets the sole holder claim 3.
     function test_twoRoundDustBuysCannotOverclaim() public {
