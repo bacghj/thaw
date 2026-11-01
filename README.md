@@ -1,0 +1,203 @@
+# 公平发射（BNB Smart Chain）
+
+**未经审计。没有部署在 BSC 主网。** 这是公开的源代码，不是已上线的代币，也不是对价格或结果的承诺。任何人在主网使用之前都需要自己再审计。
+
+**Unaudited. Not deployed on BSC mainnet.** This repository is source code only. It is not a live token and it makes no promise about price or outcome. Audit it before any mainnet use.
+
+没有管理员的公平铸造代币。铸造期按档位计价，达标后任何人都可以开池，流动性代币打进黑洞。没有团队预留、没有暂停、没有黑名单、没有升级、没有人能把募集的 BNB 提走。
+
+本仓库只做本地测试、主网分叉和脚本模拟。`script/Deploy.s.sol` 在链 ID 为 56 且带私钥时会直接回退，不会向 BSC 主网发交易。
+
+## 机制
+
+### 铸造
+
+先到先得，三个价格档，默认占硬顶的 25% / 50% / 25%：
+
+| 档 | 份额 | 默认价格 |
+| --- | --- | --- |
+| 1 | 硬顶的 25% | 0.004 BNB / 份 |
+| 2 | 硬顶的 50% | 0.005 BNB / 份 |
+| 3 | 剩下的 | 0.006 BNB / 份 |
+
+默认硬顶 30,000 份，软顶 1,000 份，窗口 48 小时，每个钱包和每个 Agent ID 最多 5 份。一次购买可以跨档，`quote` 会把各档加总。`msg.value` 必须等于报价，多了少了都回退。
+
+每一份对应的代币数量是固定的（默认每份 3,000 枚）。便宜的档拿到的币一样多，所以成本更低。开池之后不能再铸造。
+
+只有持有 Binance Agentic Wallet 的 `.ai` Agent ID 的地址可以铸造。验证器地址在部署时写死。合约调用者会被拒绝，但 EIP-7702 委托账户可以过：代码长度正好 23 字节，并且以 `0xef0100` 开头（后面 20 字节是被委托的地址）。这是规范要求的检查，不是隐藏开关。
+
+### 没达到软顶
+
+窗口结束后，如果卖出份数低于软顶，任何人可以调用 `triggerRefund()`。每个铸造者调用 `refund()` 取回自己付的全部 BNB，不扣费。进入退款后不能再开池。
+
+### 开池
+
+硬顶打满，或者窗口结束且达到软顶之后，任何人可以调用 `finalize()`。
+
+- 铸造者一共得到 `T = 卖出份数 × 每份代币`。
+- 交易对得到 `T × premiumDen / premiumNum` 枚代币，再加上募集到的全部 BNB。默认溢价 3/2，所以开盘价是平均铸造成本的 1.5 倍。
+- LP 代币铸给 `0x000000000000000000000000000000000000dEaD`。
+- 不用路由的 `addLiquidity`。合约把 WBNB 和代币直接转进工厂创建的交易对，再调用 `mint`。
+- 有人提前建好交易对、打入 WBNB 并 `sync` 时，开池会按捐赠后的 WBNB 余额补足代币，使价格仍然落在目标上。没 `sync` 的捐赠会被 `skim` 到黑洞。开池前代币不能转出，所以没法往交易对里捐赠本币。
+
+### 解锁
+
+开池时每个铸造者有 30% 可以立刻 `claim()`，70% 锁定。`claim` 不需要授权。
+
+需求解锁：只统计官方交易对的净买入（买入减卖出），并且只在下一个区块提交高水位。每净买入 100 枚，锁定供应里解锁 50 枚，按当时的锁定余额比例分配。同一笔交易里先买后卖，不会把高水位打到那一笔的毛买入上。
+
+时间保底：开池后第 7 天起，剩余锁定按 7 天线性释放，第 14 天全部可领。不要把这个窗口理解成 21 天。
+
+### 卖出罚没（14 天内，比例会衰减）
+
+开池起 3 天内，罚没倍率是 100%。从第 3 天到第 14 天，倍率线性降到 0。第 14 天整点以及之后是 0。
+
+铸造者卖出或转出自己已经领到手里的铸造代币的 X% 时，其仍在锁定中的余额被罚没 `X% × 当时倍率`。X% 的分母是该地址当前记在账上的「已领取且尚未转出」余额，不是整个钱包余额里的市价买入部分；但只要转出，就会先扣这块记账余额，所以转出买入的币也会消耗它。转给自己不算卖出。只接收币不会增加锁定。
+
+罚没的币按剩余锁定余额比例分给仍有锁定的人（含罚没者自己还剩下的锁定），用累加器一次算完，不循环持有人。如果罚没之后没有任何其他持有人还锁着币（典型情况是只剩他自己），这笔罚没烧掉，不会退回给他。小于最小单位、暂时分不出去的零头先从锁定里划走（避免靠粉尘拆单逃避），攒到最小单位再分配；窗口结束时仍分不掉的零头烧掉。
+
+第 14 天之后，罚没停止。代币就是带固定税的普通 ERC-20。
+
+### 税
+
+只对官方 PancakeSwap V2 交易对的买入和卖出收 3%，钱包互转不收。3% 写在常量里，构造函数改不了：1.5% 攒到阈值后换成 BNB 给不可变的开发者地址，1.5% 自动加进流动池并把 LP 打进黑洞。换币包在 `try/catch` 里，换失败不会让用户的卖单回退。
+
+卖出必须走路由的 `swapExactTokensForETHSupportingFeeOnTransferTokens`。不支持手续费的 `swapExactTokensForETH` 会因为交易对实际收到的数量变少而失败。用户只需要授权官方路由。铸造、领取、退款都不需要授权。
+
+## 默认参数
+
+全部在部署时确定，之后不可改。部署脚本用环境变量覆盖，缺省就是下表。
+
+| 参数 | 默认 |
+| --- | --- |
+| 硬顶 / 软顶 | 30,000 / 1,000 份 |
+| 三档价格 | 0.004 / 0.005 / 0.006 BNB |
+| 三档占比 | 25% / 50% / 其余 |
+| 每钱包、每 Agent ID | 5 份 |
+| 铸造窗口 | 48 小时 |
+| 每份代币 | 3,000（18 位小数） |
+| 开盘溢价 | 3/2（开盘价 = 1.5 × 平均铸造成本） |
+| 开池即可领取 | 30% |
+| 需求解锁 | 每净买 100 枚，解锁 50 枚锁定 |
+| 时间悬崖 / 线性释放 | 7 天 / 7 天（第 14 天释放完） |
+| 罚没全额期 / 罚没窗口 | 3 天 / 14 天 |
+| 税 | 3% = 1.5% 开发者 + 1.5% 加池（常量，不是参数） |
+| 换币阈值 / 最小单位 | 3,000 枚 / 1e12 wei |
+| 路由 / 工厂 / WBNB | Pancake V2 主网地址，见下文 |
+| Agent ID 注册表 | `0x60B9262456dE011F7d15a54CdD8c48bAaa8B022F` |
+
+## 在 BscScan 上确认没有后门
+
+部署之后，不要看网站，按这个清单对源代码：
+
+1. 源码与本仓库 `src/FairToken.sol` 精确匹配（BscScan / Sourcify 的 exact match），编译器 0.8.28，优化器打开。
+2. 合约没有 `owner`、`onlyOwner`、`upgrade`、`pause`、`blacklist`、`mint` 的管理员入口。`pair` 只在 `finalize` 里由工厂 `getPair` / `createPair` 写一次。
+3. 构造参数里的路由是 `0x10ED43C718714eb63d5aA57B78B54704E256024E`，工厂是 `0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73`，WBNB 是 `0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c`。链上可再调路由的 `factory()` 和 `WETH()` 核对。
+4. 验证器是 `AgentIdVerifier`，它的 `registry()` 是上面的 Agent ID 注册表，而不是某个可更换地址。
+5. 开发者地址是你事先认可的地址。税会永久打到那里，没有函数能改。
+6. 读 `TAX_BPS`（300）、`DEV_BPS`（150）、`LP_BPS`（150）。这三个是常量。
+7. 搜索源码里的 `transfer` / `call{value`：BNB 只在 `refund`（退给付款人）和开池包装 WBNB、以及换币时出现。没有「把余额转给调用者」的函数。
+8. 开池事件 `Finalized` 之后，LP 代币的持有者应是黑洞地址，本合约的 LP 余额为 0。
+
+## Agent ID：已核对与未核对
+
+已在 BSC 主网只读调用中核对（未发交易）：
+
+- 注册表 `0x60B9262456dE011F7d15a54CdD8c48bAaa8B022F` 有代码，`name()` 为 `SPACE ID Agent ID`，`symbol()` 为 `AI`，`supportsInterface(0x80ac58cd)` 为真。
+- `ownerOfHandle("binance")` = `0x5E3fBbc8D260a63C9fe19CbBb0A9d5792C3375eA`，`handleOf` 反向也是 `binance`，`balanceOf` 为 1，该地址代码长度为 0。
+- `ownerOf(keccak256("binance"))` 与上面的持有者一致，所以身份键用 `keccak256(handle)` 与链上 tokenId 相同。另抽查一个已注册地址，代码长度同样为 0。
+- 从持有者模拟 `transferFrom` / `approve` / `setApprovalForAll`，回退信息为 `Soulbound`。
+
+因此适配器做两件事：`handleOf` 非空，且 `ownerOfHandle` 必须指回同一个地址，身份键是 `keccak256(handle)`。测试里用 mock，不依赖这条主网注册表。
+
+未做成数学证明、使用时要知道的事：
+
+- 公开接口里 `handleOf` 只返回一个字符串。抽查的持有者 `balanceOf == 1`。没有把注册表全表扫一遍来证明任何地址的余额都不可能大于 1。按现有接口和灵魂绑定，每钱包一个 ID，所以「每 ID 上限」和「每钱包上限」在今天是同一件事。
+- 注册表自己有 `owner`、`signer`、`adminRegister`。那是 SPACE ID / Binance 的发行权，不是本代币的管理员。他们可以决定谁拿得到 ID。
+- 抽查的 Agent 钱包是外部账户。如果以后 Binance 改成普通智能合约钱包（代码长度不是 23 字节的 7702 委托），`mint` 会拒绝。7702 委托按规范放行。主网上还没有在这两个样例地址上看到 7702 代码。
+
+## 本地运行
+
+需要 [Foundry](https://book.getfoundry.sh/getting-started/installation)。
+
+```bash
+forge install foundry-rs/forge-std
+forge test --no-match-contract FairTokenForkTest
+forge test --match-contract FairTokenForkTest
+```
+
+分叉测试会连公共 BSC RPC（默认 `https://bsc-dataseed.bnbchain.org`），只读主网状态并在本地执行，不广播。也可以自己起分叉节点：
+
+```bash
+anvil --fork-url https://bsc-dataseed.bnbchain.org
+```
+
+部署脚本只做模拟。主网广播被禁：
+
+```bash
+# 会回退：chain id 56 且设置了 DEPLOYER_KEY
+forge script script/Deploy.s.sol --fork-url https://bsc-dataseed.bnbchain.org
+```
+
+可用环境变量覆盖参数：`DEV_WALLET`、`HARD_CAP`、`SOFT_CAP`、`TIER1_PRICE`、`TIER2_PRICE`、`TIER3_PRICE`、`TIER1_BPS`、`TIER2_BPS`、`MAX_PER_WALLET`、`MAX_PER_IDENTITY`、`MINT_DURATION`、`TOKENS_PER_SHARE`、`PREMIUM_NUM`、`PREMIUM_DEN`、`IMMEDIATE_BPS`、`DEMAND_NUM`、`DEMAND_DEN`、`VEST_CLIFF`、`VEST_LINEAR`、`FORFEIT_FULL_RATE`、`FORFEIT_WINDOW`、`SWAP_THRESHOLD`、`MIN_UNIT`、`ROUTER`、`FACTORY`、`WBNB`、`AGENT_REGISTRY`、`TOKEN_NAME`、`TOKEN_SYMBOL`。不要把真实私钥写进仓库。
+
+
+## 测试（本次运行）
+
+- 单元与模糊：`FairToken.t.sol` 23 项，其中 2 项模糊各 128 次。覆盖铸造、跨档报价、钱包与身份上限、7702、退款与退款重入、开池价格、预建交易对、同步与未同步的 WBNB 捐赠、代币捐赠被拒绝、直接转 BNB 被拒绝、罚没曲线（第 3 天、中点、第 14 天）、拆单不能逃避罚没、罚没再分配、需求解锁的下一区块提交、同交易买卖不能抬高水位、第 7 到第 14 天线性释放、买卖税、钱包转账免税、换币失败不拖垮卖单、换币成功给开发者并销毁 LP。
+- 不变量：5 条，32 轮、每轮深度 20（640 次调用）。锁定账本 `pool + vested + burned + earmark == initialPool`；合约代币余额等于未领铸造量加税库存；总供应等于铸造量加 LP 铸造量减销毁；开池后募集的 BNB 不留在代币合约里；罚没曲线在第 3 天仍为 100%、中点 50%、第 14 天为 0。
+- 主网分叉：真实路由 / 工厂 / WBNB / Agent ID 注册表。`binance` 这个 ID 的持有者可以铸造，无 ID 地址不行；捐赠 WBNB 并 `sync` 后仍能开池，价格误差在一次整除之内；随后真实路由买入、用支持手续费的函数卖出、第 3 天罚没、第 14 天倍率归零。
+- 覆盖率（不含分叉）：`FairToken.sol` 行 87.78%（431/491），语句 82.02%（666/812），分支 49.19%（91/185），函数 87.80%（36/41）。分支偏低主要是构造参数的失败分支和若干不可达的极端捐赠分支。
+- Slither（排除 `test/` 与 `lib/`，含信息级）：见下一节。没有留下未解释的高危问题。
+- 部署体积：运行时代码 17,877 字节（24,576 上限还剩 6,699）。构造测量用气 4,079,948。开池在分叉上约 531,604 gas。
+- 当时 BSC 主网 `eth_gasPrice`（`bsc-dataseed.bnbchain.org` 与 `bsc.publicnode.com`）都是 50,000,000 wei，即 0.05 gwei。部署费用约 `4,079,948 × 50,000,000 = 203,997,400,000,000 wei`，约 0.000204 BNB。这是读到的 gas 价，不是报价承诺。
+- 之后用一条一次性测试网私钥在 BSC 测试网（链 97）跑通了退款和开池。主网仍然没有部署。地址和交易见下一节。
+
+## BSC 测试网（链 97）
+
+这不是主网部署。参数被缩小到测试网余额能付得起：每份 0.0001 / 0.00012 / 0.00015 tBNB，硬顶 8 份，软顶 4 份，铸造窗口 5 分钟，锁定和罚没按分钟而不是按天。这些时长本来就是构造参数，生产合约逻辑没有为测试网改过。
+
+PancakeSwap V2 测试网路由 `0xD99D1c33F9fC3444f8101754aBC46c52416550D1`。链上读到的 `factory()` 是 `0x6725F303b657a9451d8BA641348b6761A6CC7a17`，`WETH()` 是 `0xae13d989daC2f0dEbFf460aC112a837C89BAa7cd`。
+
+| 合约 | 地址 |
+| --- | --- |
+| MockHandleRegistry | `0x0D771114F245508B4B75C764B1112402f0358Eae` |
+| AgentIdVerifier | `0x66454DA1e0C09AABAdbD34BC54D655F44185Fb9F` |
+| 退款那次的 FairToken | `0x9f6d650439b6706dDEE010FaD30D41c7d871247D` |
+| 开池那次的 FairToken | `0xDd2377bd797c8E14704b1c58E6703A86f0525b8D` |
+
+Sourcify 对这四个合约都是 exact match。BscScan 的验证接口需要 API key，这次没有 key，所以测试网 BscScan 页面上可能仍显示未验证。Sourcify 记录：`https://sourcify.dev/server/v2/contract/97/<address>`。
+
+## 安全自审
+
+| 威胁 | 处理 |
+| --- | --- |
+| 抢跑 / 女巫 | 只有 Agent ID 能铸造，且每个钱包和每个 ID 都有上限。ID 本身如果可以批量领取，上限挡不住真人多号。这取决于注册表的发行政策，不在本合约里。 |
+| 闪电贷抬高净买入 | 高水位只在更后的区块提交。同一交易里的买入还没记入高水位，随后的卖出会把它抵消。下一区块提交的是净额，不是中间的峰值。协议自己的换币和加池记成卖出，避免税把解锁灌高。 |
+| 交易对预先灌入 | 开池前本币不可转。WBNB 捐赠若已 `sync`，按捐赠后的余额补代币，使价格仍等于目标；未 `sync` 的捐赠 `skim` 到黑洞。不使用 `addLiquidity`，所以「储备被弄脏导致路由回退」这条路不存在。捐赠极大、乘积溢出 `uint256` 时开池会回退；这需要超出实际存在的 WBNB 数量，不作为可操作的攻击来写进流程。 |
+| 换币重入 | `inSwap` 期间只有本合约自己的转账能通过，其他转账直接回退，所以开发者地址的 `receive` 不能趁换币把一笔卖单做成免税。用户卖单外面还有 `try/catch`。`refund` 先改账再转 BNB，并有重入锁。 |
+| 取整 | 全部向下取整。罚没按 512 位乘除累加，欠下的 wei 立刻从锁定里划走，不能靠把一笔卖单拆成粉尘来逃。分给别人时按 `minUnit` 批量，分不完的在窗口结束时烧掉。单独一个持有人的罚没烧掉，避免「罚了又按比例退回给自己」。 |
+| 7702 | 仅放行 23 字节且前缀为 `0xef0100` 的代码。一个故意做成这 23 字节的合约也能过，这是规范选择的残余风险，过关之后它也没有额外权限。 |
+| 转账扣费与路由 | 卖出必须用 `swapExactTokensForETHSupportingFeeOnTransferTokens`。买入用普通 `swapExactETHForTokens` 即可，因为税是在币离开交易对之后扣的。已在本地迷你路由和主网分叉的真实路由上跑通。 |
+| Agent 钱包兼容性 | 见上一节。当前样例是外部账户。非 7702 的合约钱包不能铸造。注册表管理员可以发 ID，这是外部信任，不是本合约的后门。 |
+
+Slither 处理：
+
+- `arbitrary-send-eth`：`addLiquidityETH` 把刚换到的 BNB 交给不可变路由，LP 接收方是黑洞常量。不是把募集款打给任意地址。
+- `incorrect-exp`：`FullMath` 里的 `^` 是牛顿迭代用的异或，不是指数。误报。
+- `reentrancy-eth`（`finalize`）：账本和 `launched` 在外部调用之前写好，函数持有重入锁。`inFinalize` 在调用期间为真，结束后才清掉。
+- `reentrancy-no-eth`（换币）：用 `inSwap` 把非本合约转账直接回退，储备只在外层调用成功之后清零。
+- `divide-before-multiply` / `incorrect-equality`：有意的向下取整，以及「费率为 0 / 进度为 100%」的精确哨兵。
+- `timestamp`：窗口、解锁和罚没本来就按时间。信息级。
+- 汇编：`extcodesize` 与 `mulDiv`。信息级。
+
+已知但不在本合约里修的事：开发者地址如果填错，1.5% 会永远打错地方；没有暂停，所以发现实现错误时不能链上冻结；换币可以被夹；黑洞里的 LP 谁也拿不回来，这是设计。
+
+## 上主网之前还要人做的事
+
+1. 另找人或审计再读一遍 `src/FairToken.sol`。本文件的自审不是审计。
+2. 选定开发者地址（建议外部账户）。写进构造参数后不能改。
+3. 再确认 Agent ID 注册表仍是 `0x60B9…022F`，路由 / 工厂 / WBNB 仍是上面三个地址。
+4. 用本仓库源码做精确验证。不要用一份「看起来一样」的网页抄本。
+5. 部署必须由人在链下完成。本仓库的脚本拒绝链 ID 56 的广播。不要为了图方便把这个回退删掉再把私钥交给自动化。
+6. 测试网这次没有部署：水龙头要人机验证。

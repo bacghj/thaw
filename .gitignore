@@ -1,0 +1,10 @@
+out/
+cache/
+broadcast/
+# Testnet broadcast receipts (chain 97) stay local even if the parent rule changes.
+broadcast/*/97/
+lib/
+agent-tools/
+.gas-snapshot
+.env*
+uploads/
