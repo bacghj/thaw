@@ -232,6 +232,10 @@ contract FairToken {
     mapping(address => Account) public accounts;
     address[] public minters;
     mapping(bytes32 => uint256) public idShares;
+    /// @notice Tokens that are not part of the vesting baseline: post-open mints and tokens
+    ///         received from other wallets or the pool. Spent before the baseline, so moving
+    ///         them does not forfeit locked tokens.
+    mapping(address => uint256) public freeBalance;
 
     uint256 public sold;
     uint256 public raised;
@@ -545,6 +549,7 @@ contract FairToken {
         lpMinted += tokenAdd;
 
         _move(address(0), msg.sender, tokensOut);
+        freeBalance[msg.sender] += tokensOut;
         if (tokenAdd > 0) _move(address(0), pair, tokenAdd);
         if (lpBnb > 0) {
             IWBNB(wbnb).deposit{value: lpBnb}();
@@ -728,10 +733,14 @@ contract FairToken {
         if (inSwap) revert Reentrancy();
         if (!launched) revert TransferDisabled();
 
-        // Unlock whatever time has already earned, then forfeit only what is still locked.
-        // Self-transfers do not leave the wallet, so they are not sells.
+        // Unlock whatever time has already earned, then forfeit only the vesting baseline
+        // that this transfer actually spends. Free tokens (post-open mints, buys, inbound
+        // transfers) are consumed first and never forfeit. Self-transfers are not sells.
         _checkpoint();
-        if (from != pair && from != to) _noteSale(from, value);
+        if (from != pair && from != to) {
+            uint256 fromBaseline = _spendFree(from, value);
+            _noteSale(from, fromBaseline);
+        }
 
         // A pair-to-pair move (skim to the pair, sync leftovers routed back) does not
         // take tokens out of the pool. Counting it as a buy lets the same balance
@@ -745,6 +754,7 @@ contract FairToken {
         bool isSell = to == pair;
         if (!isBuy && !isSell) {
             _move(from, to, value);
+            if (to != from) _creditFree(to, value);
             return;
         }
 
@@ -757,6 +767,7 @@ contract FairToken {
         taxLpReserve += lpFee;
         _move(from, to, value - fee);
         if (fee > 0) _move(from, address(this), fee);
+        if (isBuy) _creditFree(to, value - fee);
 
         if (isBuy) liveNet += int256(value);
         else liveNet -= int256(value - fee);
@@ -1096,7 +1107,25 @@ contract FairToken {
         return FullMath.mulDiv(raw, vestScale, PREC * RAW);
     }
 
-    /// @dev X% of liquid baseline, times rate(t), applied immediately into `earmark` so it cannot vest.
+    /// @dev Free balance is spent before the vesting baseline. Returns the part of `amount`
+    ///      that still comes out of the baseline and can forfeit.
+    function _spendFree(address user, uint256 amount) internal returns (uint256 fromBaseline) {
+        uint256 free = freeBalance[user];
+        if (free == 0) return amount;
+        if (free >= amount) {
+            freeBalance[user] = free - amount;
+            return 0;
+        }
+        freeBalance[user] = 0;
+        return amount - free;
+    }
+
+    function _creditFree(address user, uint256 amount) internal {
+        if (amount == 0 || user == address(0) || user == address(this) || user == pair) return;
+        freeBalance[user] += amount;
+    }
+
+    /// @dev X% of the vesting baseline actually spent, times rate(t), applied immediately into `earmark`.
     ///      Dust below `minUnit` stays in `forfeitDust` (scaled) until it crosses `minUnit`.
     function _noteSale(address user, uint256 amount) internal {
         Account storage a = accounts[user];

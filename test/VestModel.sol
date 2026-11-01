@@ -19,6 +19,7 @@ contract VestModel {
         uint256 claimable;
         uint256 claimed;
         uint256 baseline;
+        uint256 freeBal;
         uint256 forfeited;
         uint256 redist;
         bool seen;
@@ -98,19 +99,28 @@ contract VestModel {
         h.baseline += paid;
     }
 
+    /// @notice Tokens received from a post-open mint, a market buy, or another wallet.
+    ///         They are spent before the vesting baseline and do not forfeit.
+    function creditFree(address user, uint256 amount) external {
+        book[user].freeBal += amount;
+    }
+
     /// @return taken Locked wei removed from the seller by this transfer.
     function transferOut(address user, uint256 amount, uint256 t) external returns (uint256 taken) {
         _sync(t);
         Holder storage h = book[user];
-        if (h.shares == 0 || amount == 0) return 0;
+        uint256 freeSpend = amount > h.freeBal ? h.freeBal : amount;
+        h.freeBal -= freeSpend;
+        uint256 fromBase = amount - freeSpend;
+        if (h.shares == 0 || fromBase == 0) return 0;
         if (t >= openTime + window) {
-            uint256 soldAll = amount > h.baseline ? h.baseline : amount;
+            uint256 soldAll = fromBase > h.baseline ? h.baseline : fromBase;
             h.baseline -= soldAll;
             return 0;
         }
         uint256 baseline = h.baseline;
         if (baseline == 0) return 0;
-        uint256 sold = amount > baseline ? baseline : amount;
+        uint256 sold = fromBase > baseline ? baseline : fromBase;
         uint256 rate = rateAt(t);
         h.baseline = baseline - sold;
         if (rate == 0 || h.locked == 0) return 0;

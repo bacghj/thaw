@@ -65,6 +65,42 @@ contract VestModelTest is Test {
         _finish(t, m, hs);
     }
 
+    function test_freeTokensDoNotForfeitAndMatchModel() public {
+        (FairToken t, VestModel m, address[] memory hs) = _crowd(2);
+        address a = hs[0];
+        address b = hs[1];
+        vm.prank(a);
+        t.claim();
+        m.claim(a, block.timestamp);
+        vm.prank(b);
+        t.claim();
+        m.claim(b, block.timestamp);
+
+        uint256 gift = t.balanceOf(b) / 2;
+        vm.prank(b);
+        t.transfer(a, gift);
+        m.transferOut(b, gift, block.timestamp);
+        m.creditFree(a, gift);
+
+        uint256 before = _forfeited(t, a);
+        vm.prank(a);
+        t.transfer(makeAddr("free-out"), gift);
+        uint256 freeTaken = m.transferOut(a, gift, block.timestamp);
+        assertEq(freeTaken, 0, "model does not forfeit free tokens");
+        assertEq(_forfeited(t, a), before, "contract does not forfeit free tokens");
+        assertEq(t.freeBalance(a), 0);
+
+        uint256 spend = t.balanceOf(a) / 2;
+        uint256 mark = _forfeited(t, a);
+        vm.prank(a);
+        t.transfer(makeAddr("base-out"), spend);
+        uint256 taken = m.transferOut(a, spend, block.timestamp);
+        assertGt(taken, 0, "baseline spend still forfeits");
+        assertLe(_gap(_forfeited(t, a) - mark, taken), 100_000, "baseline forfeit matches the model");
+        assertLe(_gap(_receivable(t, a), m.receivable(a)), 100_000, "A receivable matches");
+        assertLe(_gap(_receivable(t, b), m.receivable(b)), 100_000, "B receivable matches");
+    }
+
     function test_round5SoleTinyHolderMatchesModel() public {
         (FairToken t, VestModel m, address[] memory hs) = _crowd(6);
         _trimToWei(t, m, hs[0]);

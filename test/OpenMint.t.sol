@@ -40,6 +40,54 @@ contract OpenMintTest is Test {
         dev = makeAddr("dev");
     }
 
+    function test_postOpenAndMarketTokensDoNotForfeitBaseline() public {
+        FairToken t = _openReady(8, 1000);
+        address a = _actor("vested");
+        _mint(t, a, 4);
+        vm.warp(t.deadline());
+        t.finalize();
+        vm.prank(a);
+        t.claim();
+        uint256 baseline = t.balanceOf(a);
+        (,,,,,,,,, uint256 forfeitedBefore,,) = t.accounts(a);
+
+        _readyTwap(t);
+        (uint256 cost,) = t.quoteOpen(1);
+        vm.deal(a, a.balance + cost);
+        vm.prank(a);
+        t.mint{value: cost}(1);
+        uint256 minted = t.tokensPerShare();
+        assertEq(t.freeBalance(a), minted);
+        vm.prank(a);
+        t.transfer(makeAddr("mint-out"), minted);
+        (,,,,,,,,, uint256 forfeitedAfterMint,,) = t.accounts(a);
+        assertEq(forfeitedAfterMint, forfeitedBefore, "post-open mint does not forfeit");
+        assertEq(t.balanceOf(a), baseline);
+
+        uint256 beforeBuy = t.balanceOf(a);
+        address[] memory path = new address[](2);
+        path[0] = address(wbnb);
+        path[1] = address(t);
+        vm.prank(a);
+        router.swapExactETHForTokens{value: 0.01 ether}(0, path, a, block.timestamp);
+        uint256 bought = t.balanceOf(a) - beforeBuy;
+        assertEq(t.freeBalance(a), bought);
+        address[] memory back = new address[](2);
+        back[0] = address(t);
+        back[1] = address(wbnb);
+        vm.startPrank(a);
+        t.approve(address(router), bought);
+        router.swapExactTokensForETHSupportingFeeOnTransferTokens(bought, 0, back, a, block.timestamp);
+        vm.stopPrank();
+        (,,,,,,,,, uint256 forfeitedAfterSell,,) = t.accounts(a);
+        assertEq(forfeitedAfterSell, forfeitedBefore, "market tokens do not forfeit");
+
+        vm.prank(a);
+        t.transfer(makeAddr("base-out"), baseline / 2);
+        (,,,,,,,,, uint256 forfeitedBaseline,,) = t.accounts(a);
+        assertGt(forfeitedBaseline, forfeitedBefore, "spending the baseline still forfeits");
+    }
+
     function test_finalizeSendsTenPercentAndKeepsPremiumPrice() public {
         FairToken t = _openReady(4, 1000);
         address a = _actor("sub");
