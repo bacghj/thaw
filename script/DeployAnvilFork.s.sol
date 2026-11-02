@@ -34,8 +34,8 @@ contract DeployAnvilFork is Script {
         // ANVIL_1 is left without an Agent ID on purpose.
 
         FairToken.Params memory p;
-        p.name = "HIVEN";
-        p.symbol = "HIVEN";
+        p.name = "THAW";
+        p.symbol = "THAW";
         p.verifier = address(verifier);
         p.devWallet = ANVIL_1;
         p.router = PANCAKE_ROUTER;

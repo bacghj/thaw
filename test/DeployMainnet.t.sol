@@ -5,7 +5,7 @@ import {Test, console2} from "forge-std/Test.sol";
 import {FairToken} from "../src/FairToken.sol";
 import {AgentIdVerifier, IHandleRegistry} from "../src/verifiers/AgentIdVerifier.sol";
 import {IPancakeRouter, IPancakePair, IWBNB} from "../src/interfaces/IPancakeV2.sol";
-import {DeployMainnet, HivenMainnetConfig, CheckMainnetDeployment} from "../script/DeployMainnet.s.sol";
+import {DeployMainnet, ThawMainnetConfig, CheckMainnetDeployment} from "../script/DeployMainnet.s.sol";
 
 interface IERC20Lite {
     function totalSupply() external view returns (uint256);
@@ -14,7 +14,7 @@ interface IERC20Lite {
 /// @notice Runs the real mainnet deploy script on a BSC mainnet fork and walks the launch paths
 ///         with the approved parameters. Nothing is broadcast. Agent IDs for synthetic minters are
 ///         mocked on the real registry address; the real `AgentIdVerifier` adapter is used.
-contract DeployMainnetForkTest is Test, HivenMainnetConfig {
+contract DeployMainnetForkTest is Test, ThawMainnetConfig {
     FairToken t;
     AgentIdVerifier v;
     address[] minters;
@@ -27,8 +27,8 @@ contract DeployMainnetForkTest is Test, HivenMainnetConfig {
     }
 
     function _agent(uint256 i) internal returns (address a) {
-        a = address(uint160(uint256(keccak256(abi.encode("hiven-fork-minter", i)))));
-        string memory handle = string.concat("hivenfork", vm.toString(i));
+        a = address(uint160(uint256(keccak256(abi.encode("thaw-fork-minter", i)))));
+        string memory handle = string.concat("thawfork", vm.toString(i));
         vm.mockCall(AGENT_REGISTRY, abi.encodeCall(IHandleRegistry.handleOf, (a)), abi.encode(handle));
         vm.mockCall(AGENT_REGISTRY, abi.encodeCall(IHandleRegistry.ownerOfHandle, (handle)), abi.encode(a));
         vm.deal(a, 1 ether);
@@ -90,7 +90,7 @@ contract DeployMainnetForkTest is Test, HivenMainnetConfig {
     function test_refusesPrivateKeyEnv() public {
         vm.setEnv("PRIVATE_KEY", "0x01");
         DeployMainnet s = new DeployMainnet();
-        vm.expectRevert(abi.encodeWithSelector(HivenMainnetConfig.PrivateKeyEnvForbidden.selector, "PRIVATE_KEY"));
+        vm.expectRevert(abi.encodeWithSelector(ThawMainnetConfig.PrivateKeyEnvForbidden.selector, "PRIVATE_KEY"));
         s.run();
         vm.setEnv("PRIVATE_KEY", "");
     }
@@ -98,7 +98,7 @@ contract DeployMainnetForkTest is Test, HivenMainnetConfig {
     function test_refusesOtherChain() public {
         vm.chainId(97);
         DeployMainnet s = new DeployMainnet();
-        vm.expectRevert(abi.encodeWithSelector(HivenMainnetConfig.WrongChain.selector, uint256(97)));
+        vm.expectRevert(abi.encodeWithSelector(ThawMainnetConfig.WrongChain.selector, uint256(97)));
         s.run();
     }
 

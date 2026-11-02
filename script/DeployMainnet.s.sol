@@ -6,10 +6,10 @@ import {FairToken} from "../src/FairToken.sol";
 import {AgentIdVerifier} from "../src/verifiers/AgentIdVerifier.sol";
 import {IPancakeRouter} from "../src/interfaces/IPancakeV2.sol";
 
-/// @notice Approved HIVEN mainnet parameters. Every value is a constant: there is no env override.
+/// @notice Approved THAW mainnet parameters. Every value is a constant: there is no env override.
 ///         Changing a launch parameter means editing this file, reviewing the diff, and re-running
 ///         the fork checks in `test/DeployMainnet.t.sol`.
-abstract contract HivenMainnetConfig {
+abstract contract ThawMainnetConfig {
     uint256 internal constant CHAIN_ID = 56;
 
     address internal constant PANCAKE_ROUTER = 0x10ED43C718714eb63d5aA57B78B54704E256024E;
@@ -23,8 +23,8 @@ abstract contract HivenMainnetConfig {
     /// Immutable receiver of the 10% mint fee and the 1.5% dev tax. Must accept plain BNB.
     address internal constant DEV_WALLET = 0xb96401CD93006eb68A86Ee2006fd3f4B85e32045;
 
-    string internal constant NAME = "HIVEN";
-    string internal constant SYMBOL = "HIVEN";
+    string internal constant NAME = "THAW";
+    string internal constant SYMBOL = "THAW";
 
     uint256 internal constant HARD_CAP = 30_000;
     uint256 internal constant SOFT_CAP = 2_000;
@@ -205,11 +205,11 @@ abstract contract HivenMainnetConfig {
     }
 }
 
-/// @notice HIVEN BSC mainnet deployment. Chain 56 only. No key is read from the environment.
+/// @notice THAW BSC mainnet deployment. Chain 56 only. No key is read from the environment.
 ///         The signer must come from the CLI as a hardware wallet (`--ledger` / `--trezor`)
 ///         or an encrypted keystore (`--account <name>`), with `--sender 0x5728…1Eb8`.
 ///         Dry run (default, no `--broadcast`) only simulates.
-contract DeployMainnet is Script, HivenMainnetConfig {
+contract DeployMainnet is Script, ThawMainnetConfig {
     function run() external returns (FairToken token, AgentIdVerifier verifier) {
         checkChain();
         _refuseKeyEnv();
@@ -249,7 +249,7 @@ contract DeployMainnet is Script, HivenMainnetConfig {
 ///         first mint (it also asserts fresh state): every immutable equals the approved value, no admin
 ///         entry points, LP/pair not yet created.
 ///         `forge script script/DeployMainnet.s.sol:CheckMainnetDeployment --sig "run(address)" <token> --rpc-url bsc`
-contract CheckMainnetDeployment is Script, HivenMainnetConfig {
+contract CheckMainnetDeployment is Script, ThawMainnetConfig {
     function run(address token) external view {
         checkChain();
         FairToken t = FairToken(payable(token));

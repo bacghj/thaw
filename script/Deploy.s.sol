@@ -40,8 +40,8 @@ contract Deploy is Script {
     }
 
     function _params() internal view returns (FairToken.Params memory p) {
-        p.name = vm.envOr("TOKEN_NAME", string("HIVEN"));
-        p.symbol = vm.envOr("TOKEN_SYMBOL", string("HIVEN"));
+        p.name = vm.envOr("TOKEN_NAME", string("THAW"));
+        p.symbol = vm.envOr("TOKEN_SYMBOL", string("THAW"));
         p.devWallet = vm.envOr("DEV_WALLET", address(0));
         if (p.devWallet == address(0)) revert MissingConfig();
         p.router = vm.envOr("ROUTER", block.chainid == 56 ? PANCAKE_ROUTER : address(0));
