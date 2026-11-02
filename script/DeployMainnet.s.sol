@@ -37,7 +37,7 @@ abstract contract HivenMainnetConfig {
     uint256 internal constant TIER2_END = 22_500;
     uint256 internal constant MAX_PER_WALLET = 5;
     uint256 internal constant MAX_PER_IDENTITY = 5;
-    uint256 internal constant MINT_DURATION = 48 hours;
+    uint256 internal constant MINT_DURATION = 72 hours; // 259200
     uint256 internal constant TOKENS_PER_SHARE = 3000 ether;
     uint256 internal constant PREMIUM_NUM = 3;
     uint256 internal constant PREMIUM_DEN = 2;
@@ -121,7 +121,7 @@ abstract contract HivenMainnetConfig {
         _req(p.twapMaxDeviationBps > 0 && p.twapMaxDeviationBps <= 2000, "deviation guard on, <=20%");
         _req(p.forfeitWindow == p.vestCliff + p.vestLinear, "forfeit ends when vest ends");
         _req(p.forfeitFullRate < p.vestCliff, "full forfeit inside cliff");
-        _req(p.mintDuration == 48 hours, "48h window");
+        _req(p.mintDuration == 72 hours && p.mintDuration == 259200, "72h window");
         _req(p.immediateUnlockBps == 1500, "15% at open");
     }
 

@@ -10,7 +10,7 @@
 | 每份代币 | 3,000 HIVEN |
 | 价格档 | 1–7,500：0.004 BNB；7,501–22,500：0.005 BNB；22,501–30,000：0.006 BNB |
 | 每钱包（认购期）/ 每 Agent ID（终身） | 5 / 5 份 |
-| 认购窗口 | 48 小时（`deadline = 部署区块时间 + 172800`） |
+| 认购窗口 | 72 小时（`deadline = 部署区块时间 + 259200`） |
 | 开池价 | 平均成本 × 3/2 |
 | 铸造 BNB 分配 | 10% 项目钱包 / 90% 流动池 |
 | 解锁 | 开池 15%；需求解锁 1:2；cliff 604800 秒 + 线性 604800 秒 |
@@ -82,7 +82,7 @@ forge script script/DeployMainnet.s.sol:CheckMainnetDeployment \
   --sig "run(address)" <token 地址> --rpc-url https://bsc-dataseed.bnbchain.org
 ```
 
-应输出 `on-chain readback matches approved params`。再在 BscScan 上看 `deadline()`，应等于部署交易的区块时间 + 172800。
+应输出 `on-chain readback matches approved params`。再在 BscScan 上看 `deadline()`，应等于部署交易的区块时间 + 259200。
 
 ## 5. 源码验证
 

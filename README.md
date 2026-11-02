@@ -6,7 +6,7 @@
 
 没有管理员的公平铸造代币。铸造期按档位计价，达标后任何人都可以开池，流动性代币打进黑洞。没有团队预留、没有暂停、没有黑名单、没有升级。开池时按写死的比例把募集 BNB 的一成分给开发者地址，其余进流动池；没有人能改这个比例，也没有人能把其余的 BNB 提走。
 
-本仓库只做本地测试、主网分叉和脚本模拟。`script/Deploy.s.sol` 在链 ID 为 56 且带私钥时会直接回退，不会向 BSC 主网发交易。
+本仓库做本地测试、主网分叉和脚本模拟。通用脚本 `script/Deploy.s.sol` 在链 ID 为 56 且带私钥时会直接回退；主网部署只走 `script/DeployMainnet.s.sol`（链 56），只能用硬件钱包或加密 keystore 签名，不接受明文私钥，见 `DEPLOY_MAINNET.md`。
 
 ## 机制
 
@@ -146,7 +146,7 @@ forge test --match-contract FairTokenForkTest
 anvil --fork-url https://bsc-dataseed.bnbchain.org
 ```
 
-部署脚本只做模拟。主网广播被禁：
+通用部署脚本 `Deploy.s.sol` 只做模拟，主网广播被禁（主网用 `DeployMainnet.s.sol` + 硬件钱包/keystore）：
 
 ```bash
 # 会回退：chain id 56 且设置了 DEPLOYER_KEY
