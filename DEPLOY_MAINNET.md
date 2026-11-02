@@ -1,4 +1,4 @@
-# HIVEN 主网部署步骤（BSC，链 56）
+# THAW 主网部署步骤（BSC，链 56）
 
 脚本：`script/DeployMainnet.s.sol`。合约源码（`src/`）不改。仓库里不放私钥，`.env` 也不放。脚本发现 `DEPLOYER_KEY` / `PRIVATE_KEY` / `ETH_PRIVATE_KEY` / `MAINNET_KEY` 任一非空会直接回退。签名只用硬件钱包（`--ledger` / `--trezor`）或加密 keystore（`--account`）。
 
@@ -7,7 +7,7 @@
 | 参数 | 值 |
 |---|---|
 | 硬顶 / 软顶 | 30,000 / 2,000 份 |
-| 每份代币 | 3,000 HIVEN |
+| 每份代币 | 3,000 THAW |
 | 价格档 | 1–7,500：0.004 BNB；7,501–22,500：0.005 BNB；22,501–30,000：0.006 BNB |
 | 每钱包（认购期）/ 每 Agent ID（终身） | 5 / 5 份 |
 | 认购窗口 | 72 小时（`deadline = 部署区块时间 + 259200`） |
@@ -16,7 +16,7 @@
 | 解锁 | 开池 15%；需求解锁 1:2；cliff 604800 秒 + 线性 604800 秒 |
 | 罚没 | 前 259200 秒 100%，到 1209600 秒线性降到 0 |
 | 开池后铸造 | TWAP 窗口 1800 秒，偏离上限 10% |
-| 换币阈值 / 最小单位 | 3,000 HIVEN / 1e12 |
+| 换币阈值 / 最小单位 | 3,000 THAW / 1e12 |
 | 路由 / 工厂 / WBNB | `0x10ED…024E` / `0xcA14…0c73` / `0xbb4C…095c` |
 | Agent ID 注册表 | `0x60B9262456dE011F7d15a54CdD8c48bAaa8B022F` |
 | 项目钱包（不可改） | `0xb96401CD93006eb68A86Ee2006fd3f4B85e32045` |
@@ -101,6 +101,12 @@ forge verify-contract <extension> src/FairTokenExt.sol:FairTokenExt --chain 56 -
 `FairTokenExt` 的构造参数和 `FairToken` 相同（同一个 `Params`）。BscScan 用同样的命令，改成 `--verifier etherscan --etherscan-api-key <你的 key>`。key 只在命令行或本机环境里用，不提交。
 
 然后按 README「在 BscScan 上确认没有后门」的 8 条逐项核对。
+
+## 6. 网站切到主网
+
+1. 在 `web/public/config.mainnet.json` 里填 `tokenAddress` 和 `verifier`。
+2. `cd web && npm run site:mainnet`。脚本会校验链 ID 56 和路由 / 工厂 / WBNB / 注册表 / 项目钱包地址，地址为空或是测试网地址会拒绝。构建结果没有 TESTNET 横幅。
+3. 先发布到预览域名检查，确认后再发布正式域名。发布是单独的 `surge` 命令，构建脚本不会上传。
 
 ## 现在不要做
 

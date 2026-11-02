@@ -47,7 +47,11 @@
 
 价格不是档位价，也不是交易对的瞬时价格。每份价格 = `每份代币 × TWAP`。TWAP 读的是 PancakeSwap V2 交易对自己累计的价格（`price0CumulativeLast` / `price1CumulativeLast`），窗口默认 30 分钟。开池后要等满第一个窗口才能铸。同一笔交易里先砸盘或拉盘，再来铸造，改不了这个均价：交易对在本区块已经更新过储备时，新价格计入累计值的时间是 0 秒。另有一道便宜的护栏：现价偏离 TWAP 超过 `twapMaxDeviationBps`（默认 10%）时，这次铸造直接回退，避免有人拉高现价后用旧均价铸出币再卖回池子。
 
-付的 BNB 同样是 10% 给开发者地址，90% 按当时储备比例配上新铸的代币加进流动池，所以这一加池本身不推动价格。LP 仍然打进黑洞。除不尽的零头随整笔交易回退或退回，不会留在合约里。
+TWAP 的参考点：合约在一个 4 格环形缓冲里记交易对的累计价格检查点，最多每半个窗口（`ceil(twapWindow/2)`，默认 15 分钟）写一次；转账、`poke` 和铸造都会顺手尝试写，但没到间隔就只读一个存储槽直接返回，所以每笔转账的额外开销是固定的。算价时取「至少满一个窗口那么旧」的最新检查点，从它到现在求平均。4 个检查点彼此至少隔半个窗口，倒数第三个必然已满一个窗口，所以交易再频繁也不会把参考点刷得太新而卡住铸造（旧版就有这个问题，见下文测试网说明）。交易持续时平均区间在 1 到约 1.5 个窗口之间；如果长时间没人动，区间会更长（仍是链上累计均价，单个区块推不动），此时若均价已明显过时，上面的现价偏离护栏会拒绝铸造。单个区块把价格拉高 k 倍，对均价的影响约为 `(k−1) × 区块秒数 / 窗口秒数`；往下砸最多影响 `区块秒数 / 窗口秒数`（约 0.17%），因为价格不会低于 0。
+
+`quoteOpen` 与同一区块里的 `mint` 用完全相同的读法（先读价、再写检查点），所以报价就是同区块会扣的钱。
+
+付款：`msg.value` 是买家愿付的上限，必须不少于 TWAP 成本，否则回退 `WrongPayment(成本, 实付)`。只按成本扣款：成本的 10% 给开发者地址，90% 按当时储备比例配上新铸的代币加进流动池，所以这一加池本身不推动价格。LP 仍然打进黑洞。多付的部分在同一笔交易最后原路退回给调用者（先改完全部状态，最后转账，期间仍持有重入锁）。网站发送「报价 + 1%」，并显示实际扣款和退回金额。
 
 铸造者立刻收到 `每份代币 × 份数`，这些币不进入锁定、也不进罚没账。仍然只有 Agent ID 可以铸。
 
@@ -155,6 +159,7 @@ forge script script/Deploy.s.sol --fork-url https://bsc-dataseed.bnbchain.org
 
 可用环境变量覆盖参数：`DEV_WALLET`、`HARD_CAP`、`SOFT_CAP`、`TIER1_PRICE`、`TIER2_PRICE`、`TIER3_PRICE`、`TIER1_BPS`、`TIER2_BPS`、`MAX_PER_WALLET`、`MAX_PER_IDENTITY`、`MINT_DURATION`、`TOKENS_PER_SHARE`、`PREMIUM_NUM`、`PREMIUM_DEN`、`IMMEDIATE_BPS`、`DEMAND_NUM`、`DEMAND_DEN`、`VEST_CLIFF`、`VEST_LINEAR`、`FORFEIT_FULL_RATE`、`FORFEIT_WINDOW`、`SWAP_THRESHOLD`、`MIN_UNIT`、`ROUTER`、`FACTORY`、`WBNB`、`AGENT_REGISTRY`、`TOKEN_NAME`、`TOKEN_SYMBOL`。不要把真实私钥写进仓库。
 
+Agent 调用说明见 [SKILL.md](SKILL.md)，索引见 [llms.txt](llms.txt)。网站在 `web/`，本地运行方式见 `web/README.md`。页面不会部署合约，也不会发布到公网。
 
 ## 测试（本次运行）
 
@@ -163,9 +168,23 @@ forge script script/Deploy.s.sol --fork-url https://bsc-dataseed.bnbchain.org
 - 主网分叉：真实路由 / 工厂 / WBNB / Agent ID 注册表。`binance` 这个 ID 的持有者可以铸造，无 ID 地址不行；捐赠 WBNB 并 `sync` 后仍能开池，价格误差在一次整除之内；随后真实路由买入、用支持手续费的函数卖出、第 3 天罚没、第 14 天倍率归零。
 - 覆盖率（不含分叉）：`FairToken.sol` 行 87.78%（431/491），语句 82.02%（666/812），分支 49.19%（91/185），函数 87.80%（36/41）。分支偏低主要是构造参数的失败分支和若干不可达的极端捐赠分支。
 - Slither（排除 `test/` 与 `lib/`，含信息级）：见下一节。没有留下未解释的高危问题。
-- 部署体积：运行时代码 17,877 字节（24,576 上限还剩 6,699）。构造测量用气 4,079,948。开池在分叉上约 531,604 gas。
+- 部署体积：运行时代码一度长到 29,229 字节，超过 EIP-170 的 24,576 上限，无法部署。现已按下文「代码布局」拆分：`FairToken` 运行时 22,925 字节，`FairTokenExt` 18,278 字节，`FairTokenParams` 库 3,054 字节；`FairToken` 初始化代码 47,154 字节（带构造参数约 48,340，EIP-3860 上限 49,152）。`test/Size.t.sol` 断言这些上限。
+- 用气（拆分前 → 拆分后 → 加入 TWAP 检查点环之后）：6000 持有人开池 1,538,396 → 1,542,190 → 1,542,312；首次领取 276,471 → 277,269 → 268,050；触发罚没的转账 310,807 → 315,229 → 306,032；第 10 天领取 361,774 → 362,865 → 353,135。转账和领取变便宜，是因为不再每笔都写 TWAP 观测，最多每半个窗口写一次。部署测量用气 6,537,037 → 9,158,054 → 9,202,113。
+- 测试共 71 项，全部通过：原 62 项未改动；3 项体积/权限；6 项开池后铸造（高频活动 4 小时仍可铸、多付精确退回、少付回退、单区块 10 倍拉盘对 TWAP 影响 < 2%、单区块砸盘对 TWAP 影响 < 0.25% 且被现价护栏拒绝、检查点环始终有够旧的参考点）。其中高频、多付、检查点环 3 项在旧实现上会失败。
 - 当时 BSC 主网 `eth_gasPrice`（`bsc-dataseed.bnbchain.org` 与 `bsc.publicnode.com`）都是 50,000,000 wei，即 0.05 gwei。部署费用约 `4,079,948 × 50,000,000 = 203,997,400,000,000 wei`，约 0.000204 BNB。这是读到的 gas 价，不是报价承诺。
 - 之后用一条一次性测试网私钥在 BSC 测试网（链 97）跑通了退款和开池。主网仍然没有部署。地址和交易见下一节。
+
+## 代码布局（给审计）
+
+拆分只移动代码，不改逻辑：
+
+- `src/FairTokenBase.sol`（抽象合约）：全部存储、不可变量、内部函数和事件，从原 `FairToken.sol` 原样移过来。错误类型改为文件级声明；`FairToken` 里按原名再声明一次，所以测试里的 `FairToken.X.selector` 不变，ABI 中同名错误会出现两次（选择器相同，无害）。
+- `src/FairToken.sol`：入口合约。对外函数签名、选择器、存储布局和事件都没变。新增一个只读 `extension()`。`finalize`、开池后铸造 `mint`（开池后分支）、`noteSale` 和 `flushEarmarkAll` 的函数体移到扩展合约，入口里只剩 `delegatecall` 转发，回退数据原样冒泡。
+- `src/FairTokenExt.sol`：在 `FairToken` 构造函数里 `new` 出来，地址不可变。它继承同一个 `FairTokenBase`，所以存储槽完全一致；只能被它的代币通过 `delegatecall` 调用（`onlyToken`），直接调用回退 `Forbidden`。
+- `src/FairTokenParams.sol`：外部链接库，构造参数检查原样搬进去（同样的 `InvalidParams("...")` 文案）。部署时需要先部署或链接这个库。
+- `name` / `symbol` 改在 `FairToken` 构造函数里赋值，扩展合约的初始化代码因此更小。
+
+拆分之后另有两处有意的逻辑修改（只涉及开池后铸造）：TWAP 观测改为 4 格检查点环（`twapObsTs` / `twapObsCum` / `twapObsHead` 取代 `twapOlderTs` / `twapNewerTs` / `twapOlderCum` / `twapNewerCum`），`_mintOpen` 先读价再写检查点；`_mintOpen` 接受 `msg.value >= 成本`，按成本分配手续费和加池，多付部分最后退回，`OpenMinted.paid` 记的是成本。认购阶段仍要求精确付款。
 
 ## BSC 测试网（链 97）
 
@@ -173,14 +192,41 @@ forge script script/Deploy.s.sol --fork-url https://bsc-dataseed.bnbchain.org
 
 PancakeSwap V2 测试网路由 `0xD99D1c33F9fC3444f8101754aBC46c52416550D1`。链上读到的 `factory()` 是 `0x6725F303b657a9451d8BA641348b6761A6CC7a17`，`WETH()` 是 `0xae13d989daC2f0dEbFf460aC112a837C89BAa7cd`。
 
+当前（2026-11-02 05:51 SGT 部署，含 TWAP 检查点环与多付退回）：
+
 | 合约 | 地址 |
 | --- | --- |
-| MockHandleRegistry | `0x0D771114F245508B4B75C764B1112402f0358Eae` |
-| AgentIdVerifier | `0x66454DA1e0C09AABAdbD34BC54D655F44185Fb9F` |
-| 退款那次的 FairToken | `0x9f6d650439b6706dDEE010FaD30D41c7d871247D` |
-| 开池那次的 FairToken | `0xDd2377bd797c8E14704b1c58E6703A86f0525b8D` |
+| MockHandleRegistry | `0xb27eB336B109c32C454d1874360952d8444bcf6B` |
+| AgentIdVerifier | `0xe54D12732Fd90c03E09DCB326E0bDB2b5D071f30` |
+| FairTokenParams（库） | `0x2DeF7c6f02BA9166BA74dA6853afCEbC58E8a12c` |
+| 开池那次的 FairToken（网站使用） | `0xa80EeBDaCA755E9a60865c8533E8aC71E1515d93` |
+| 它的 FairTokenExt | `0xAbe566b806508d3a2d4Bc0581Fc86C8dE07DB65b` |
+| 退款那次的 FairToken | `0x3142990cC537d12238C92Efa24aD6a5d4D3f565e` |
+| 它的 FairTokenExt | `0xBb0574CdD03010D71cAa9D545265f6e1C316160B` |
 
-Sourcify 对这四个合约都是 exact match。BscScan 的验证接口需要 API key，这次没有 key，所以测试网 BscScan 页面上可能仍显示未验证。Sourcify 记录：`https://sourcify.dev/server/v2/contract/97/<address>`。
+开池交易对 `0x7d5688b377A2d3EB46da0B474Daffc7Ba7512096`。注册表里登记了两个测试 Agent：部署者和一次性测试钱包 `0x35b178f4eDcba37DE3A2B1600d4d13cC67Faf1D5`。冒烟交易（时间为 SGT）：
+
+| 步骤 | 交易 |
+| --- | --- |
+| mint(4)（认购） | `0x01259d4094beb48d754430ae3c02a9439621edc259dc57ab70989b595d46ebaa` |
+| finalize 05:56:35 | `0x89083980a169dbdd08720d3919475f28387258604cf5e77e61ae1858eb2e8d7c` |
+| claim | `0xbcfc50f1578d8f93948d170da7457a65075d353187abc800d21ae9a45eb29edf` |
+| 开池后铸造 1 份（agent2，前几秒刚有 poke/转账/买卖），多付 1% 已退回 | `0x08483ea3bb655860e738e30b8ce5d340ebc97967160b1e2710c09d12ba032fec` |
+| 开池后铸造 2 份（agent2） | `0xbafcc2207e2bed13f7c582bb9c4aff2f01e47e5b0d2dbe59667ca9fc46bd9058` |
+| 开池后铸造 1 份（部署者），硬顶 8 份铸满 | `0x773dd2038f4560e0899bf99cff7c0c330ae5cb953a414e3b9503f768afcab03a` |
+| 退款：mint(1) | `0xff1b8fe5b68bddccd7223b0f7a299bd2a0d9b7ec802f7fb971d569542ee59461` |
+| 退款：triggerRefund | `0xf408e54745f1396faf4d1c46ad246cbebddb04ec8e9b54279fb90a6c12d6cf3f` |
+| 退款：refund | `0xec113a768c117c687244e6bc230cb6daed188734a5c6d49f2f8f9ccc68a7e90b` |
+
+开池后约 45 分钟里，每 5–7 秒有一笔 poke、转账或小额买卖（共约 345 笔，全部成功），期间 `quoteOpen` 一直可用，三次开池后铸造全部成功；每次多付的部分按 `OpenMinted.paid` 精确退回（如第一笔：发送 1,081,507,876,571,940 wei，扣 1,070,826,660,330,000，退 10,681,216,241,940）。少付的模拟调用回退 `WrongPayment`。铸造前后代币合约的 BNB 余额不变。
+
+冒烟中还看到一次 `TwapDeviation`：活动脚本前 30 分钟每 4 笔就买 0.00002 tBNB，而池子只有约 0.0004 tBNB，现价被推到 TWAP 的 2 倍，现价护栏按设计拒绝了铸造。之后改成买卖相抵的活动并卖回一次让现价回到 TWAP 附近，铸造随即成功。价格单边快速变动（30 分钟内超过 `twapMaxDeviationBps`）时，开池后铸造会被护栏暂时拒绝，这是有意的取舍。
+
+已修复（2026-11-02）：旧版 `mint` 先观测再读 TWAP，频繁转账会把参考点刷得太新，导致长时间 `TwapNotReady`（旧测试网 05:09 SGT 那次就是这样）；旧版还要求精确付款，报价一变就 `WrongPayment`。现改为检查点环 + 多付退回，见上文「开池之后继续铸造」。
+
+Sourcify 对以上合约都是 match。BscScan 的验证接口需要 API key，这次没有 key，所以测试网 BscScan 页面上可能仍显示未验证。Sourcify 记录：`https://sourcify.dev/server/v2/contract/97/<address>`。
+
+更早的测试网部署已弃用。拆分后、修复前：注册表 `0xb5D3EfD26556b93Ac46499294B575944EdFf2090`、验证器 `0x2D676E62aF0EcBE3e7617142A07304a6d04249De`、库 `0xAE5963DBB78fa5fe4b168926A9357F777205bDF0`、代币 `0xcdeB8D208C46f14a825D1d51E9207caDECd79390` / `0xD08D4ecF98B55523Af3cD9016009fD8dc2ff21E6`。拆分前：注册表 `0x0D771114F245508B4B75C764B1112402f0358Eae`、验证器 `0x66454DA1e0C09AABAdbD34BC54D655F44185Fb9F`、代币 `0x9f6d650439b6706dDEE010FaD30D41c7d871247D` / `0xDd2377bd797c8E14704b1c58E6703A86f0525b8D`。
 
 ## 安全自审
 
