@@ -1,142 +1,142 @@
-# 公平发射（BNB Smart Chain）
+# THAW
 
-**未经审计。没有部署在 BSC 主网。** 这是公开的源代码，不是已上线的代币，也不是对价格或结果的承诺。任何人在主网使用之前都需要自己再审计。
+English | [中文](README.zh-CN.md)
 
 **Unaudited. Not deployed on BSC mainnet.** This repository is source code only. It is not a live token and it makes no promise about price or outcome. Audit it before any mainnet use.
 
-没有管理员的公平铸造代币。铸造期按档位计价，达标后任何人都可以开池，流动性代币打进黑洞。没有团队预留、没有暂停、没有黑名单、没有升级。开池时按写死的比例把募集 BNB 的一成分给开发者地址，其余进流动池；没有人能改这个比例，也没有人能把其余的 BNB 提走。
+THAW is an ownerless fair-mint ERC-20 on BNB Smart Chain that only addresses holding an Agent ID can mint. The mint is priced in tiers. Once the targets are met, anyone can open the pool, and the LP tokens are sent to a burn address. There is no reserved allocation, no pause, no blacklist and no upgrade path. At pool opening, a hard-coded share (10%) of the raised BNB goes to the developer address and the rest goes into the liquidity pool. Nobody can change that share, and nobody can withdraw the remaining BNB.
 
-本仓库做本地测试、主网分叉和脚本模拟。通用脚本 `script/Deploy.s.sol` 在链 ID 为 56 且带私钥时会直接回退；主网部署只走 `script/DeployMainnet.s.sol`（链 56），只能用硬件钱包或加密 keystore 签名，不接受明文私钥，见 `DEPLOY_MAINNET.md`。
+This repository covers local tests, BSC mainnet fork tests and script simulations. The generic script `script/Deploy.s.sol` reverts on chain ID 56 when a private key is set. Mainnet deployment goes only through `script/DeployMainnet.s.sol` (chain 56), signed with a hardware wallet or an encrypted keystore; plaintext private keys are rejected. See [DEPLOY_MAINNET.md](DEPLOY_MAINNET.md).
 
-## 机制
+## Mechanics
 
-### 铸造
+### Mint
 
-先到先得，三个价格档，默认占硬顶的 25% / 50% / 25%：
+First come, first served, in three price tiers that by default cover 25% / 50% / 25% of the hard cap:
 
-| 档 | 份额 | 默认价格 |
+| Tier | Share | Default price |
 | --- | --- | --- |
-| 1 | 硬顶的 25% | 0.004 BNB / 份 |
-| 2 | 硬顶的 50% | 0.005 BNB / 份 |
-| 3 | 剩下的 | 0.006 BNB / 份 |
+| 1 | 25% of the hard cap | 0.004 BNB / share |
+| 2 | 50% of the hard cap | 0.005 BNB / share |
+| 3 | the remainder | 0.006 BNB / share |
 
-默认硬顶 30,000 份，软顶 1,000 份，窗口 48 小时。每个钱包在认购期最多 5 份。每个 Agent ID 一生最多 5 份，认购和开池后的铸造算在一起，不是按天重置。一次购买可以跨档，`quote` 会把各档加总。`msg.value` 必须等于报价，多了少了都回退。
+Default hard cap 30,000 shares, soft cap 1,000 shares, window 48 hours. Each wallet can buy at most 5 shares during the sale. Each Agent ID can mint at most 5 shares over its lifetime; sale mints and post-open mints count together, and the limit does not reset daily. A single purchase can span tiers; `quote` sums across tiers. `msg.value` must equal the quote exactly; paying more or less reverts.
 
-每一份对应的代币数量是固定的（默认每份 3,000 枚）。便宜的档拿到的币一样多，所以成本更低。
+Each share carries a fixed number of tokens (default 3,000). Cheaper tiers get the same number of tokens, so their cost is lower.
 
-只有持有 Binance Agentic Wallet 的 `.ai` Agent ID 的地址可以铸造。验证器地址在部署时写死。合约调用者会被拒绝，但 EIP-7702 委托账户可以过：代码长度正好 23 字节，并且以 `0xef0100` 开头（后面 20 字节是被委托的地址）。这是规范要求的检查，不是隐藏开关。
+Only addresses holding a `.ai` Agent ID from Binance Agentic Wallet can mint. The verifier address is fixed at deployment. Contract callers are rejected, but EIP-7702 delegated accounts pass: code length exactly 23 bytes, starting with `0xef0100` (followed by the 20-byte delegate address). This is the check the spec calls for, not a hidden switch.
 
-### 没达到软顶
+### Soft cap not reached
 
-窗口结束后，如果卖出份数低于软顶，任何人可以调用 `triggerRefund()`。每个铸造者调用 `refund()` 取回自己付的全部 BNB，不扣费。进入退款后不能再开池，开发者地址也拿不到铸造费。
+After the window ends, if fewer shares than the soft cap were sold, anyone can call `triggerRefund()`. Each minter calls `refund()` to get back all the BNB they paid, with no fee. Once in refund mode, the pool can no longer be opened and the developer address receives no mint fee.
 
-### 开池
+### Pool opening
 
-硬顶打满，或者窗口结束且达到软顶之后，任何人可以调用 `finalize()`。
+Once the hard cap is filled, or the window has ended with the soft cap reached, anyone can call `finalize()`.
 
-- 铸造者一共得到 `T = 卖出份数 × 每份代币`。
-- 募集 BNB 的 `mintFeeBps`（默认 10%）打给不可变的开发者地址。其余（默认 90%）进交易对。
-- 配进交易对的代币数量按这 90% 来算，使开盘价仍然是「溢价 × 全部募集额的平均铸造成本」。默认溢价 3/2，所以开盘价是平均成本的 1.5 倍，而不是 1.5 倍再打九折。
-- LP 代币铸给 `0x000000000000000000000000000000000000dEaD`。
-- 不用路由的 `addLiquidity`。合约把 WBNB 和代币直接转进工厂创建的交易对，再调用 `mint`。
-- 有人提前建好交易对、打入 WBNB 并 `sync` 时，开池会按捐赠后的 WBNB 余额补足代币，使价格仍然落在目标上。没 `sync` 的捐赠会被 `skim` 到黑洞。开池前代币不能转出，所以没法往交易对里捐赠本币。
+- Minters receive `T = shares sold × tokens per share` in total.
+- `mintFeeBps` (default 10%) of the raised BNB goes to the immutable developer address. The rest (default 90%) goes into the pair.
+- The token amount paired with that 90% is computed so that the opening price is still "premium × average mint cost over the full raise". The default premium is 3/2, so the opening price is 1.5× the average cost, not 1.5× minus 10%.
+- LP tokens are minted to `0x000000000000000000000000000000000000dEaD`.
+- The router's `addLiquidity` is not used. The contract transfers WBNB and tokens directly into the factory-created pair and calls `mint`.
+- If someone pre-creates the pair, donates WBNB and calls `sync`, pool opening tops up tokens against the post-donation WBNB balance so the price still lands on target. Donations without `sync` are `skim`med to the burn address. Tokens cannot be transferred before pool opening, so the token side cannot be donated.
 
-### 开池之后继续铸造
+### Minting after pool opening
 
-硬顶没卖完的份，开池后还可以铸，直到 `sold == hardCap`。打满之后供应永久固定。
+Shares left unsold under the hard cap can still be minted after pool opening, until `sold == hardCap`. Once the cap is filled, supply is permanently fixed.
 
-价格不是档位价，也不是交易对的瞬时价格。每份价格 = `每份代币 × TWAP`。TWAP 读的是 PancakeSwap V2 交易对自己累计的价格（`price0CumulativeLast` / `price1CumulativeLast`），窗口默认 30 分钟。开池后要等满第一个窗口才能铸。同一笔交易里先砸盘或拉盘，再来铸造，改不了这个均价：交易对在本区块已经更新过储备时，新价格计入累计值的时间是 0 秒。另有一道便宜的护栏：现价偏离 TWAP 超过 `twapMaxDeviationBps`（默认 10%）时，这次铸造直接回退，避免有人拉高现价后用旧均价铸出币再卖回池子。
+The price is neither a tier price nor the pair's spot price. Price per share = `tokens per share × TWAP`. The TWAP reads the PancakeSwap V2 pair's own cumulative prices (`price0CumulativeLast` / `price1CumulativeLast`), with a default window of 30 minutes. After pool opening, minting waits until the first full window has elapsed. Dumping or pumping and then minting in the same transaction cannot move this average: when the pair has already updated its reserves in the current block, the new price contributes 0 seconds to the cumulative value. There is also a cheap guard: if the spot price deviates from the TWAP by more than `twapMaxDeviationBps` (default 10%), the mint reverts, so nobody can pump the spot price, mint at the stale average and sell back into the pool.
 
-TWAP 的参考点：合约在一个 4 格环形缓冲里记交易对的累计价格检查点，最多每半个窗口（`ceil(twapWindow/2)`，默认 15 分钟）写一次；转账、`poke` 和铸造都会顺手尝试写，但没到间隔就只读一个存储槽直接返回，所以每笔转账的额外开销是固定的。算价时取「至少满一个窗口那么旧」的最新检查点，从它到现在求平均。4 个检查点彼此至少隔半个窗口，倒数第三个必然已满一个窗口，所以交易再频繁也不会把参考点刷得太新而卡住铸造（旧版就有这个问题，见下文测试网说明）。交易持续时平均区间在 1 到约 1.5 个窗口之间；如果长时间没人动，区间会更长（仍是链上累计均价，单个区块推不动），此时若均价已明显过时，上面的现价偏离护栏会拒绝铸造。单个区块把价格拉高 k 倍，对均价的影响约为 `(k−1) × 区块秒数 / 窗口秒数`；往下砸最多影响 `区块秒数 / 窗口秒数`（约 0.17%），因为价格不会低于 0。
+TWAP reference point: the contract keeps a 4-slot ring buffer of the pair's cumulative-price checkpoints, written at most once per half window (`ceil(twapWindow/2)`, default 15 minutes). Transfers, `poke` and mints all try to write one, but before the interval has passed they read a single storage slot and return, so the extra cost per transfer is constant. Pricing uses the most recent checkpoint that is at least one full window old and averages from it to now. The 4 checkpoints are at least half a window apart, so the third-most-recent one is always at least a full window old; however frequent the trading, the reference point cannot be refreshed too recently to block minting (the old version had this problem; see the testnet notes below). With continuous trading, the averaging interval is between 1 and about 1.5 windows. If nobody touches the contract for a long time, the interval gets longer (still an on-chain cumulative average that a single block cannot push), and if the average is clearly stale, the spot-deviation guard above rejects the mint. Pumping the price k× in a single block shifts the average by about `(k−1) × block seconds / window seconds`; dumping shifts it by at most `block seconds / window seconds` (about 0.17%), because the price cannot go below 0.
 
-`quoteOpen` 与同一区块里的 `mint` 用完全相同的读法（先读价、再写检查点），所以报价就是同区块会扣的钱。
+`quoteOpen` reads exactly the same way as `mint` in the same block (read the price first, then write the checkpoint), so the quote is what a same-block mint charges.
 
-付款：`msg.value` 是买家愿付的上限，必须不少于 TWAP 成本，否则回退 `WrongPayment(成本, 实付)`。只按成本扣款：成本的 10% 给开发者地址，90% 按当时储备比例配上新铸的代币加进流动池，所以这一加池本身不推动价格。LP 仍然打进黑洞。多付的部分在同一笔交易最后原路退回给调用者（先改完全部状态，最后转账，期间仍持有重入锁）。网站发送「报价 + 1%」，并显示实际扣款和退回金额。
+Payment: `msg.value` is the buyer's maximum and must be at least the TWAP cost, otherwise the call reverts with `WrongPayment(cost, paid)`. Only the cost is charged: 10% of it goes to the developer address, and 90% is added to the pool together with newly minted tokens at the current reserve ratio, so this liquidity add does not move the price. LP still goes to the burn address. Any overpayment is refunded to the caller at the end of the same transaction (all state is updated first, the transfer happens last, and the reentrancy lock is still held). The website sends "quote + 1%" and shows the amount charged and refunded.
 
-铸造者立刻收到 `每份代币 × 份数`，这些币不进入锁定、也不进罚没账。仍然只有 Agent ID 可以铸。
+Minters receive `tokens per share × shares` immediately; these tokens are not locked and not subject to forfeiture. Only Agent IDs can mint.
 
-### 解锁
+### Unlocking
 
-认购拿到的币，开池时默认 15% 可以立刻 `claim()`，其余锁定。`claim` 不需要授权。开池后铸造的币不在这 15% 里面，它们本来就是解锁的。
+Of the tokens from the sale, 15% (default) can be claimed with `claim()` right at pool opening; the rest is locked. `claim` needs no approval. Tokens minted after pool opening are not part of this 15%; they are unlocked from the start.
 
-需求解锁：只统计官方交易对的净买入（买入减卖出），并且只在下一个区块提交高水位。每净买入 100 枚，锁定供应里解锁 50 枚，按当时的锁定余额比例分配。同一笔交易里先买后卖，不会把高水位打到那一笔的毛买入上。
+Demand unlock: only net buys (buys minus sells) on the official pair count, and the high-water mark is committed only in a later block. Every 100 tokens of net buying unlocks 50 tokens of locked supply, distributed pro rata to locked balances at that time. Buying and then selling in the same transaction does not raise the high-water mark to that transaction's gross buy.
 
-时间保底：开池后第 7 天起，剩余锁定按 7 天线性释放，第 14 天全部可领。不要把这个窗口理解成 21 天。
+Time floor: from day 7 after pool opening, remaining locked tokens release linearly over 7 days and are fully claimable on day 14. Do not read this as a 21-day window.
 
-### 卖出罚没（14 天内，比例会衰减）
+### Sell forfeiture (within 14 days, decaying rate)
 
-开池起 3 天内，罚没倍率是 100%。从第 3 天到第 14 天，倍率线性降到 0。第 14 天整点以及之后是 0。
+For the first 3 days after pool opening, the forfeiture multiplier is 100%. From day 3 to day 14 it decreases linearly to 0. At exactly day 14 and after, it is 0.
 
-铸造者卖掉或转出自己领取出来的认购代币的 X% 时，其仍在锁定中的余额被罚没 `X% × 当时倍率`。X% 的分母只算这桶「领取出来、还没转走」的认购币。开池后铸造的币、从交易对买来的币、以及别人转进来的币，记在单独的自由余额里，转出时先花这一桶，不触发罚没。转给自己不算卖出。只接收币不会增加锁定。
+When a minter sells or transfers X% of their claimed sale tokens, `X% × current multiplier` of their still-locked balance is forfeited. The denominator of X% is only this bucket of "claimed and not yet transferred" sale tokens. Tokens minted after pool opening, tokens bought from the pair and tokens received from others are tracked in a separate free balance, which is spent first on transfer and does not trigger forfeiture. Transfers to yourself are not sales. Receiving tokens never increases your locked balance.
 
-罚没的币按剩余锁定余额比例分给其他仍有锁定的人。卖家自己这次拿不回这笔罚没。如果罚没之后没有其他持有人还锁着币，这笔罚没烧掉。持有人超过 6 个时，时间解锁和罚没再分配都走全局指数，一笔转账只动卖家、买家和全局变量；不超过 6 个时按整数逐个结算，和对照模型一致。小于最小单位、暂时分不出去的零头先从锁定里划走（避免靠粉尘拆单逃避），攒到最小单位再分配；窗口结束时仍分不掉的零头烧掉。
+Forfeited tokens are distributed to other holders that still have locked tokens, pro rata to their remaining locked balances. The seller does not get any of that forfeiture back. If no other holder still has locked tokens after the forfeiture, the forfeited tokens are burned. With more than 6 holders, time unlocks and forfeiture redistribution use a global index, so one transfer only touches the seller, the buyer and global variables; with 6 or fewer, they are settled per holder in integers and match the reference model. Fractions below the minimum unit that cannot be distributed yet are first removed from the locked balance (so dust-splitting cannot dodge forfeiture) and distributed once they add up to the minimum unit; any fraction still undistributable at the end of the window is burned.
 
-第 14 天之后，罚没停止。代币就是带固定税的普通 ERC-20。
+After day 14, forfeiture stops. The token is then a plain ERC-20 with a fixed tax.
 
-### 税
+### Tax
 
-只对官方 PancakeSwap V2 交易对的买入和卖出收 3%，钱包互转不收。3% 写在常量里，构造函数改不了：1.5% 攒到阈值后换成 BNB 给不可变的开发者地址，1.5% 自动加进流动池并把 LP 打进黑洞。换币包在 `try/catch` 里，换失败不会让用户的卖单回退。
+A 3% tax applies only to buys and sells on the official PancakeSwap V2 pair; wallet-to-wallet transfers are not taxed. The 3% is a constant that the constructor cannot change: 1.5% accumulates up to a threshold and is swapped to BNB for the immutable developer address, and 1.5% is auto-added to the liquidity pool with the LP sent to the burn address. The swap is wrapped in `try/catch`, so a failed swap does not revert the user's sell.
 
-卖出必须走路由的 `swapExactTokensForETHSupportingFeeOnTransferTokens`。不支持手续费的 `swapExactTokensForETH` 会因为交易对实际收到的数量变少而失败。用户只需要授权官方路由。铸造、领取、退款都不需要授权。
+Sells must go through the router's `swapExactTokensForETHSupportingFeeOnTransferTokens`. The non-fee-supporting `swapExactTokensForETH` fails because the pair receives less than expected. Users only need to approve the official router. Mint, claim and refund need no approval.
 
-## 默认参数
+## Default parameters
 
-全部在部署时确定，之后不可改。部署脚本用环境变量覆盖，缺省就是下表。
+All fixed at deployment and immutable afterwards. The deploy script overrides them via environment variables; the defaults are below. The mainnet script `script/DeployMainnet.s.sol` pins its own values (for example a 2,000-share soft cap and a 72-hour window) and reverts on any mismatch; see [DEPLOY_MAINNET.md](DEPLOY_MAINNET.md).
 
-| 参数 | 默认 |
+| Parameter | Default |
 | --- | --- |
-| 硬顶 / 软顶 | 30,000 / 1,000 份 |
-| 三档价格 | 0.004 / 0.005 / 0.006 BNB |
-| 三档占比 | 25% / 50% / 其余 |
-| 每钱包认购上限 | 5 份 |
-| 每 Agent ID 终身上限 | 5 份（认购 + 开池后铸造） |
-| 铸造窗口 | 48 小时 |
-| 每份代币 | 3,000（18 位小数） |
-| 开盘溢价 | 3/2（开盘价 = 1.5 × 平均铸造成本） |
-| 铸造费 | 10% 给开发者地址，90% 进流动池 |
-| 开池后价格 | 30 分钟 TWAP，现价偏离超过 10% 则拒绝 |
-| 认购开池即可领取 | 15% |
-| 需求解锁 | 每净买 100 枚，解锁 50 枚锁定 |
-| 时间悬崖 / 线性释放 | 7 天 / 7 天（第 14 天释放完） |
-| 罚没全额期 / 罚没窗口 | 3 天 / 14 天 |
-| 税 | 3% = 1.5% 开发者 + 1.5% 加池（常量，不是参数） |
-| 换币阈值 / 最小单位 | 3,000 枚 / 1e12 wei |
-| 路由 / 工厂 / WBNB | Pancake V2 主网地址，见下文 |
-| Agent ID 注册表 | `0x60B9262456dE011F7d15a54CdD8c48bAaa8B022F` |
+| Hard cap / soft cap | 30,000 / 1,000 shares |
+| Tier prices | 0.004 / 0.005 / 0.006 BNB |
+| Tier shares | 25% / 50% / remainder |
+| Per-wallet sale limit | 5 shares |
+| Per-Agent-ID lifetime limit | 5 shares (sale + post-open mints) |
+| Mint window | 48 hours |
+| Tokens per share | 3,000 (18 decimals) |
+| Opening premium | 3/2 (opening price = 1.5 × average mint cost) |
+| Mint fee | 10% to the developer address, 90% to the liquidity pool |
+| Post-open price | 30-minute TWAP; rejected if spot deviates by more than 10% |
+| Sale tokens claimable at opening | 15% |
+| Demand unlock | 50 locked tokens per 100 tokens net bought |
+| Time cliff / linear release | 7 days / 7 days (fully released on day 14) |
+| Full forfeiture period / forfeiture window | 3 days / 14 days |
+| Tax | 3% = 1.5% developer + 1.5% liquidity (constant, not a parameter) |
+| Swap threshold / minimum unit | 3,000 tokens / 1e12 wei |
+| Router / factory / WBNB | PancakeSwap V2 mainnet addresses, see below |
+| Agent ID registry | `0x60B9262456dE011F7d15a54CdD8c48bAaa8B022F` |
 
-## 在 BscScan 上确认没有后门
+## Checking for backdoors on BscScan
 
-部署之后，不要看网站，按这个清单对源代码：
+After deployment, ignore any website and check the source against this list:
 
-1. 源码与本仓库 `src/FairToken.sol` 精确匹配（BscScan / Sourcify 的 exact match），编译器 0.8.28，优化器打开。
-2. 合约没有 `owner`、`onlyOwner`、`upgrade`、`pause`、`blacklist`、`mint` 的管理员入口。`pair` 只在 `finalize` 里由工厂 `getPair` / `createPair` 写一次。
-3. 构造参数里的路由是 `0x10ED43C718714eb63d5aA57B78B54704E256024E`，工厂是 `0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73`，WBNB 是 `0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c`。链上可再调路由的 `factory()` 和 `WETH()` 核对。
-4. 验证器是 `AgentIdVerifier`，它的 `registry()` 是上面的 Agent ID 注册表，而不是某个可更换地址。
-5. 开发者地址是你事先认可的地址。税会永久打到那里，没有函数能改。
-6. 读 `TAX_BPS`（300）、`DEV_BPS`（150）、`LP_BPS`（150）。这三个是常量。
-7. 搜索源码里的 `transfer` / `call{value`：BNB 只在 `refund`（退给付款人）、开池和开池后铸造的固定比例手续费（打给不可变的开发者地址）、包装 WBNB、以及换币时出现。没有管理员提取函数。
-8. 开池事件 `Finalized` 之后，LP 代币的持有者应是黑洞地址，本合约的 LP 余额为 0。
+1. The source exactly matches `src/FairToken.sol` in this repository (BscScan / Sourcify exact match), compiler 0.8.28, optimizer on.
+2. The contract has no `owner`, `onlyOwner`, `upgrade`, `pause`, `blacklist` or admin `mint` entry point. `pair` is written once, only in `finalize`, from the factory's `getPair` / `createPair`.
+3. The constructor arguments use router `0x10ED43C718714eb63d5aA57B78B54704E256024E`, factory `0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73` and WBNB `0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c`. You can cross-check with the router's `factory()` and `WETH()` on chain.
+4. The verifier is `AgentIdVerifier`, and its `registry()` is the Agent ID registry above, not some replaceable address.
+5. The developer address is one you have approved in advance. Tax goes there permanently and no function can change it.
+6. Read `TAX_BPS` (300), `DEV_BPS` (150) and `LP_BPS` (150). These three are constants.
+7. Search the source for `transfer` / `call{value`: BNB moves only in `refund` (back to the payer), in the fixed-ratio fee at pool opening and on post-open mints (to the immutable developer address), when wrapping WBNB, and during swaps. There is no admin withdrawal function.
+8. After the `Finalized` event, the LP token holder should be the burn address and this contract's LP balance should be 0.
 
-## Agent ID：已核对与未核对
+## Agent ID: verified and not verified
 
-已在 BSC 主网只读调用中核对（未发交易）：
+Verified with read-only calls on BSC mainnet (no transactions sent):
 
-- 注册表 `0x60B9262456dE011F7d15a54CdD8c48bAaa8B022F` 有代码，`name()` 为 `SPACE ID Agent ID`，`symbol()` 为 `AI`，`supportsInterface(0x80ac58cd)` 为真。
-- `ownerOfHandle("binance")` = `0x5E3fBbc8D260a63C9fe19CbBb0A9d5792C3375eA`，`handleOf` 反向也是 `binance`，`balanceOf` 为 1，该地址代码长度为 0。
-- `ownerOf(keccak256("binance"))` 与上面的持有者一致，所以身份键用 `keccak256(handle)` 与链上 tokenId 相同。另抽查一个已注册地址，代码长度同样为 0。
-- 从持有者模拟 `transferFrom` / `approve` / `setApprovalForAll`，回退信息为 `Soulbound`。
+- Registry `0x60B9262456dE011F7d15a54CdD8c48bAaa8B022F` has code, `name()` is `SPACE ID Agent ID`, `symbol()` is `AI`, and `supportsInterface(0x80ac58cd)` is true.
+- `ownerOfHandle("binance")` = `0x5E3fBbc8D260a63C9fe19CbBb0A9d5792C3375eA`, the reverse `handleOf` is also `binance`, `balanceOf` is 1, and that address has code length 0.
+- `ownerOf(keccak256("binance"))` matches the holder above, so using `keccak256(handle)` as the identity key equals the on-chain tokenId. Another registered address was spot-checked and also has code length 0.
+- Simulating `transferFrom` / `approve` / `setApprovalForAll` from the holder reverts with `Soulbound`.
 
-因此适配器做两件事：`handleOf` 非空，且 `ownerOfHandle` 必须指回同一个地址，身份键是 `keccak256(handle)`。测试里用 mock，不依赖这条主网注册表。
+The adapter therefore checks two things: `handleOf` is non-empty, and `ownerOfHandle` points back to the same address; the identity key is `keccak256(handle)`. Tests use a mock and do not depend on the mainnet registry.
 
-未做成数学证明、使用时要知道的事：
+Not mathematically proven; things to know when using it:
 
-- 公开接口里 `handleOf` 只返回一个字符串。抽查的持有者 `balanceOf == 1`。没有把注册表全表扫一遍来证明任何地址的余额都不可能大于 1。按现有接口和灵魂绑定，每钱包一个 ID，所以「每 ID 上限」和「每钱包上限」在今天是同一件事。
-- 注册表自己有 `owner`、`signer`、`adminRegister`。那是 SPACE ID / Binance 的发行权，不是本代币的管理员。他们可以决定谁拿得到 ID。
-- 抽查的 Agent 钱包是外部账户。如果以后 Binance 改成普通智能合约钱包（代码长度不是 23 字节的 7702 委托），`mint` 会拒绝。7702 委托按规范放行。主网上还没有在这两个样例地址上看到 7702 代码。
+- In the public interface, `handleOf` returns a single string. The spot-checked holder has `balanceOf == 1`. The full registry was not scanned to prove that no address can have a balance above 1. Given the current interface and soulbinding, there is one ID per wallet, so today the per-ID limit and the per-wallet limit are the same thing.
+- The registry itself has `owner`, `signer` and `adminRegister`. Those are SPACE ID / Binance issuance rights, not admin rights over this token. They decide who can get an ID.
+- The spot-checked Agent wallets are externally owned accounts. If Binance later moves to ordinary smart-contract wallets (code that is not a 23-byte 7702 delegation), `mint` will reject them. 7702 delegations pass per the spec. No 7702 code has been seen on the two sample addresses on mainnet so far.
 
-## 本地运行
+## Build and test
 
-需要 [Foundry](https://book.getfoundry.sh/getting-started/installation)。
+Requires [Foundry](https://book.getfoundry.sh/getting-started/installation).
 
 ```bash
 forge install foundry-rs/forge-std
@@ -144,120 +144,122 @@ forge test --no-match-contract FairTokenForkTest
 forge test --match-contract FairTokenForkTest
 ```
 
-分叉测试会连公共 BSC RPC（默认 `https://bsc-dataseed.bnbchain.org`），只读主网状态并在本地执行，不广播。也可以自己起分叉节点：
+Fork tests connect to a public BSC RPC (default `https://bsc-dataseed.bnbchain.org`), read mainnet state only and execute locally without broadcasting. You can also run your own fork node:
 
 ```bash
 anvil --fork-url https://bsc-dataseed.bnbchain.org
 ```
 
-通用部署脚本 `Deploy.s.sol` 只做模拟，主网广播被禁（主网用 `DeployMainnet.s.sol` + 硬件钱包/keystore）：
+The generic deploy script `Deploy.s.sol` only simulates; mainnet broadcasting is blocked (mainnet uses `DeployMainnet.s.sol` with a hardware wallet or keystore):
 
 ```bash
-# 会回退：chain id 56 且设置了 DEPLOYER_KEY
+# Reverts: chain id 56 with DEPLOYER_KEY set
 forge script script/Deploy.s.sol --fork-url https://bsc-dataseed.bnbchain.org
 ```
 
-可用环境变量覆盖参数：`DEV_WALLET`、`HARD_CAP`、`SOFT_CAP`、`TIER1_PRICE`、`TIER2_PRICE`、`TIER3_PRICE`、`TIER1_BPS`、`TIER2_BPS`、`MAX_PER_WALLET`、`MAX_PER_IDENTITY`、`MINT_DURATION`、`TOKENS_PER_SHARE`、`PREMIUM_NUM`、`PREMIUM_DEN`、`IMMEDIATE_BPS`、`DEMAND_NUM`、`DEMAND_DEN`、`VEST_CLIFF`、`VEST_LINEAR`、`FORFEIT_FULL_RATE`、`FORFEIT_WINDOW`、`SWAP_THRESHOLD`、`MIN_UNIT`、`ROUTER`、`FACTORY`、`WBNB`、`AGENT_REGISTRY`、`TOKEN_NAME`、`TOKEN_SYMBOL`。不要把真实私钥写进仓库。
+Parameters can be overridden with environment variables: `DEV_WALLET`, `HARD_CAP`, `SOFT_CAP`, `TIER1_PRICE`, `TIER2_PRICE`, `TIER3_PRICE`, `TIER1_BPS`, `TIER2_BPS`, `MAX_PER_WALLET`, `MAX_PER_IDENTITY`, `MINT_DURATION`, `TOKENS_PER_SHARE`, `PREMIUM_NUM`, `PREMIUM_DEN`, `IMMEDIATE_BPS`, `DEMAND_NUM`, `DEMAND_DEN`, `VEST_CLIFF`, `VEST_LINEAR`, `FORFEIT_FULL_RATE`, `FORFEIT_WINDOW`, `SWAP_THRESHOLD`, `MIN_UNIT`, `ROUTER`, `FACTORY`, `WBNB`, `AGENT_REGISTRY`, `TOKEN_NAME`, `TOKEN_SYMBOL`. Never commit a real private key.
 
-Agent 调用说明见 [SKILL.md](SKILL.md)，索引见 [llms.txt](llms.txt)。网站在 `web/`，本地运行方式见 `web/README.md`。页面不会部署合约，也不会发布到公网。
+## Test results (as recorded)
 
-## 测试（本次运行）
+- Unit and fuzz: 23 tests in `FairToken.t.sol`, including 2 fuzz tests at 128 runs each. They cover minting, cross-tier quotes, wallet and identity limits, 7702, refunds and refund reentrancy, opening price, pre-created pairs, synced and unsynced WBNB donations, rejected token donations, rejected direct BNB transfers, the forfeiture curve (day 3, midpoint, day 14), dust-splitting not escaping forfeiture, forfeiture redistribution, next-block commit of demand unlocks, same-transaction buy/sell not raising the high-water mark, linear release from day 7 to day 14, buy/sell tax, tax-free wallet transfers, failed swaps not breaking sells, and successful swaps paying the developer and burning LP.
+- Invariants: 5, at 32 runs × depth 20 (640 calls). Lock ledger `pool + vested + burned + earmark == initialPool`; the contract's token balance equals unclaimed mint amount plus tax inventory; total supply equals minted amount plus LP mints minus burns; raised BNB does not stay in the token contract after pool opening; the forfeiture curve is still 100% on day 3, 50% at the midpoint and 0 on day 14.
+- Mainnet fork: real router / factory / WBNB / Agent ID registry. The holder of the `binance` ID can mint and an address without an ID cannot; pool opening still works after a WBNB donation plus `sync`, with the price within one integer division; then a real-router buy, a sell via the fee-supporting function, day-3 forfeiture and a zero multiplier on day 14.
+- Coverage (excluding fork): `FairToken.sol` lines 87.78% (431/491), statements 82.02% (666/812), branches 49.19% (91/185), functions 87.80% (36/41). Branch coverage is lower mainly because of constructor-parameter failure branches and some unreachable extreme-donation branches.
+- Slither (excluding `test/` and `lib/`, informational included): see the next sections. No unexplained high-severity findings remain.
+- Deployment size: runtime code once grew to 29,229 bytes, above the EIP-170 limit of 24,576, and could not be deployed. It is now split as described in "Code layout": `FairToken` runtime 22,925 bytes, `FairTokenExt` 18,278 bytes, `FairTokenParams` library 3,054 bytes; `FairToken` init code 47,154 bytes (about 48,340 with constructor arguments; EIP-3860 limit 49,152). `test/Size.t.sol` asserts these limits.
+- Gas (before split → after split → after adding the TWAP checkpoint ring): opening with 6,000 holders 1,538,396 → 1,542,190 → 1,542,312; first claim 276,471 → 277,269 → 268,050; transfer that triggers forfeiture 310,807 → 315,229 → 306,032; day-10 claim 361,774 → 362,865 → 353,135. Transfers and claims got cheaper because the TWAP observation is no longer written on every transfer, only at most once per half window. Measured deployment gas 6,537,037 → 9,158,054 → 9,202,113.
+- 71 tests in total, all passing: the original 62 unchanged; 3 size/permission tests; 6 post-open mint tests (minting still works after 4 hours of high-frequency activity, exact overpayment refund, underpayment reverts, a single-block 10× pump moves the TWAP by < 2%, a single-block dump moves it by < 0.25% and is rejected by the spot guard, the checkpoint ring always has a sufficiently old reference point). The high-frequency, overpayment and checkpoint-ring tests fail on the old implementation.
+- At the time, BSC mainnet `eth_gasPrice` (`bsc-dataseed.bnbchain.org` and `bsc.publicnode.com`) was 50,000,000 wei, i.e. 0.05 gwei. Deployment cost was about `4,079,948 × 50,000,000 = 203,997,400,000,000 wei`, about 0.000204 BNB. This is the gas price read at the time, not a quote.
+- Refund and pool opening were then run end to end on BSC testnet (chain 97) with a throwaway testnet key. Mainnet is still not deployed. Addresses and transactions are in the testnet section.
 
-- 单元与模糊：`FairToken.t.sol` 23 项，其中 2 项模糊各 128 次。覆盖铸造、跨档报价、钱包与身份上限、7702、退款与退款重入、开池价格、预建交易对、同步与未同步的 WBNB 捐赠、代币捐赠被拒绝、直接转 BNB 被拒绝、罚没曲线（第 3 天、中点、第 14 天）、拆单不能逃避罚没、罚没再分配、需求解锁的下一区块提交、同交易买卖不能抬高水位、第 7 到第 14 天线性释放、买卖税、钱包转账免税、换币失败不拖垮卖单、换币成功给开发者并销毁 LP。
-- 不变量：5 条，32 轮、每轮深度 20（640 次调用）。锁定账本 `pool + vested + burned + earmark == initialPool`；合约代币余额等于未领铸造量加税库存；总供应等于铸造量加 LP 铸造量减销毁；开池后募集的 BNB 不留在代币合约里；罚没曲线在第 3 天仍为 100%、中点 50%、第 14 天为 0。
-- 主网分叉：真实路由 / 工厂 / WBNB / Agent ID 注册表。`binance` 这个 ID 的持有者可以铸造，无 ID 地址不行；捐赠 WBNB 并 `sync` 后仍能开池，价格误差在一次整除之内；随后真实路由买入、用支持手续费的函数卖出、第 3 天罚没、第 14 天倍率归零。
-- 覆盖率（不含分叉）：`FairToken.sol` 行 87.78%（431/491），语句 82.02%（666/812），分支 49.19%（91/185），函数 87.80%（36/41）。分支偏低主要是构造参数的失败分支和若干不可达的极端捐赠分支。
-- Slither（排除 `test/` 与 `lib/`，含信息级）：见下一节。没有留下未解释的高危问题。
-- 部署体积：运行时代码一度长到 29,229 字节，超过 EIP-170 的 24,576 上限，无法部署。现已按下文「代码布局」拆分：`FairToken` 运行时 22,925 字节，`FairTokenExt` 18,278 字节，`FairTokenParams` 库 3,054 字节；`FairToken` 初始化代码 47,154 字节（带构造参数约 48,340，EIP-3860 上限 49,152）。`test/Size.t.sol` 断言这些上限。
-- 用气（拆分前 → 拆分后 → 加入 TWAP 检查点环之后）：6000 持有人开池 1,538,396 → 1,542,190 → 1,542,312；首次领取 276,471 → 277,269 → 268,050；触发罚没的转账 310,807 → 315,229 → 306,032；第 10 天领取 361,774 → 362,865 → 353,135。转账和领取变便宜，是因为不再每笔都写 TWAP 观测，最多每半个窗口写一次。部署测量用气 6,537,037 → 9,158,054 → 9,202,113。
-- 测试共 71 项，全部通过：原 62 项未改动；3 项体积/权限；6 项开池后铸造（高频活动 4 小时仍可铸、多付精确退回、少付回退、单区块 10 倍拉盘对 TWAP 影响 < 2%、单区块砸盘对 TWAP 影响 < 0.25% 且被现价护栏拒绝、检查点环始终有够旧的参考点）。其中高频、多付、检查点环 3 项在旧实现上会失败。
-- 当时 BSC 主网 `eth_gasPrice`（`bsc-dataseed.bnbchain.org` 与 `bsc.publicnode.com`）都是 50,000,000 wei，即 0.05 gwei。部署费用约 `4,079,948 × 50,000,000 = 203,997,400,000,000 wei`，约 0.000204 BNB。这是读到的 gas 价，不是报价承诺。
-- 之后用一条一次性测试网私钥在 BSC 测试网（链 97）跑通了退款和开池。主网仍然没有部署。地址和交易见下一节。
+## Code layout (for auditors)
 
-## 代码布局（给审计）
+The split only moves code; it does not change logic:
 
-拆分只移动代码，不改逻辑：
+- `src/FairTokenBase.sol` (abstract): all storage, immutables, internal functions and events, moved verbatim from the original `FairToken.sol`. Errors are now file-level declarations; `FairToken` redeclares them under the same names, so `FairToken.X.selector` in tests is unchanged and errors with the same name appear twice in the ABI (same selector, harmless).
+- `src/FairToken.sol`: the entry contract. External function signatures, selectors, storage layout and events are unchanged. A read-only `extension()` was added. The bodies of `finalize`, post-open `mint` (the post-open branch), `noteSale` and `flushEarmarkAll` moved to the extension contract; the entry contract only forwards via `delegatecall`, and revert data bubbles up unchanged.
+- `src/FairTokenExt.sol`: created with `new` in the `FairToken` constructor, at an immutable address. It inherits the same `FairTokenBase`, so storage slots are identical; it can only be called by its token via `delegatecall` (`onlyToken`), and direct calls revert with `Forbidden`.
+- `src/FairTokenParams.sol`: an external linked library holding the constructor parameter checks, moved verbatim (same `InvalidParams("...")` messages). The library must be deployed or linked before deployment.
+- `name` / `symbol` are assigned in the `FairToken` constructor, which keeps the extension's init code smaller.
 
-- `src/FairTokenBase.sol`（抽象合约）：全部存储、不可变量、内部函数和事件，从原 `FairToken.sol` 原样移过来。错误类型改为文件级声明；`FairToken` 里按原名再声明一次，所以测试里的 `FairToken.X.selector` 不变，ABI 中同名错误会出现两次（选择器相同，无害）。
-- `src/FairToken.sol`：入口合约。对外函数签名、选择器、存储布局和事件都没变。新增一个只读 `extension()`。`finalize`、开池后铸造 `mint`（开池后分支）、`noteSale` 和 `flushEarmarkAll` 的函数体移到扩展合约，入口里只剩 `delegatecall` 转发，回退数据原样冒泡。
-- `src/FairTokenExt.sol`：在 `FairToken` 构造函数里 `new` 出来，地址不可变。它继承同一个 `FairTokenBase`，所以存储槽完全一致；只能被它的代币通过 `delegatecall` 调用（`onlyToken`），直接调用回退 `Forbidden`。
-- `src/FairTokenParams.sol`：外部链接库，构造参数检查原样搬进去（同样的 `InvalidParams("...")` 文案）。部署时需要先部署或链接这个库。
-- `name` / `symbol` 改在 `FairToken` 构造函数里赋值，扩展合约的初始化代码因此更小。
+After the split there are two intentional logic changes (post-open minting only): TWAP observations now use a 4-slot checkpoint ring (`twapObsTs` / `twapObsCum` / `twapObsHead` replace `twapOlderTs` / `twapNewerTs` / `twapOlderCum` / `twapNewerCum`), and `_mintOpen` reads the price before writing the checkpoint; `_mintOpen` accepts `msg.value >= cost`, distributes the fee and liquidity add based on cost, and refunds any overpayment at the end, with `OpenMinted.paid` recording the cost. The sale phase still requires exact payment.
 
-拆分之后另有两处有意的逻辑修改（只涉及开池后铸造）：TWAP 观测改为 4 格检查点环（`twapObsTs` / `twapObsCum` / `twapObsHead` 取代 `twapOlderTs` / `twapNewerTs` / `twapOlderCum` / `twapNewerCum`），`_mintOpen` 先读价再写检查点；`_mintOpen` 接受 `msg.value >= 成本`，按成本分配手续费和加池，多付部分最后退回，`OpenMinted.paid` 记的是成本。认购阶段仍要求精确付款。
+## BSC testnet (chain 97)
 
-## BSC 测试网（链 97）
+This is not a mainnet deployment. Parameters were scaled down to what a testnet balance can pay: 0.0001 / 0.00012 / 0.00015 tBNB per share, hard cap 8 shares, soft cap 4 shares, a 5-minute mint window, and locking and forfeiture in minutes instead of days. These durations are constructor parameters; the production contract logic was not changed for testnet.
 
-这不是主网部署。参数被缩小到测试网余额能付得起：每份 0.0001 / 0.00012 / 0.00015 tBNB，硬顶 8 份，软顶 4 份，铸造窗口 5 分钟，锁定和罚没按分钟而不是按天。这些时长本来就是构造参数，生产合约逻辑没有为测试网改过。
+PancakeSwap V2 testnet router `0xD99D1c33F9fC3444f8101754aBC46c52416550D1`. Its on-chain `factory()` is `0x6725F303b657a9451d8BA641348b6761A6CC7a17` and `WETH()` is `0xae13d989daC2f0dEbFf460aC112a837C89BAa7cd`.
 
-PancakeSwap V2 测试网路由 `0xD99D1c33F9fC3444f8101754aBC46c52416550D1`。链上读到的 `factory()` 是 `0x6725F303b657a9451d8BA641348b6761A6CC7a17`，`WETH()` 是 `0xae13d989daC2f0dEbFf460aC112a837C89BAa7cd`。
+Current (deployed 2026-11-02 05:51 SGT, with the TWAP checkpoint ring and overpayment refund):
 
-当前（2026-11-02 05:51 SGT 部署，含 TWAP 检查点环与多付退回）：
-
-| 合约 | 地址 |
+| Contract | Address |
 | --- | --- |
 | MockHandleRegistry | `0xb27eB336B109c32C454d1874360952d8444bcf6B` |
 | AgentIdVerifier | `0xe54D12732Fd90c03E09DCB326E0bDB2b5D071f30` |
-| FairTokenParams（库） | `0x2DeF7c6f02BA9166BA74dA6853afCEbC58E8a12c` |
-| 开池那次的 FairToken（网站使用） | `0xa80EeBDaCA755E9a60865c8533E8aC71E1515d93` |
-| 它的 FairTokenExt | `0xAbe566b806508d3a2d4Bc0581Fc86C8dE07DB65b` |
-| 退款那次的 FairToken | `0x3142990cC537d12238C92Efa24aD6a5d4D3f565e` |
-| 它的 FairTokenExt | `0xBb0574CdD03010D71cAa9D545265f6e1C316160B` |
+| FairTokenParams (library) | `0x2DeF7c6f02BA9166BA74dA6853afCEbC58E8a12c` |
+| FairToken from the pool-opening run (used by the website) | `0xa80EeBDaCA755E9a60865c8533E8aC71E1515d93` |
+| Its FairTokenExt | `0xAbe566b806508d3a2d4Bc0581Fc86C8dE07DB65b` |
+| FairToken from the refund run | `0x3142990cC537d12238C92Efa24aD6a5d4D3f565e` |
+| Its FairTokenExt | `0xBb0574CdD03010D71cAa9D545265f6e1C316160B` |
 
-开池交易对 `0x7d5688b377A2d3EB46da0B474Daffc7Ba7512096`。注册表里登记了两个测试 Agent：部署者和一次性测试钱包 `0x35b178f4eDcba37DE3A2B1600d4d13cC67Faf1D5`。冒烟交易（时间为 SGT）：
+Pool-opening pair `0x7d5688b377A2d3EB46da0B474Daffc7Ba7512096`. Two test Agents are registered: the deployer and a throwaway test wallet `0x35b178f4eDcba37DE3A2B1600d4d13cC67Faf1D5`. Smoke-test transactions (times in SGT):
 
-| 步骤 | 交易 |
+| Step | Transaction |
 | --- | --- |
-| mint(4)（认购） | `0x01259d4094beb48d754430ae3c02a9439621edc259dc57ab70989b595d46ebaa` |
+| mint(4) (sale) | `0x01259d4094beb48d754430ae3c02a9439621edc259dc57ab70989b595d46ebaa` |
 | finalize 05:56:35 | `0x89083980a169dbdd08720d3919475f28387258604cf5e77e61ae1858eb2e8d7c` |
 | claim | `0xbcfc50f1578d8f93948d170da7457a65075d353187abc800d21ae9a45eb29edf` |
-| 开池后铸造 1 份（agent2，前几秒刚有 poke/转账/买卖），多付 1% 已退回 | `0x08483ea3bb655860e738e30b8ce5d340ebc97967160b1e2710c09d12ba032fec` |
-| 开池后铸造 2 份（agent2） | `0xbafcc2207e2bed13f7c582bb9c4aff2f01e47e5b0d2dbe59667ca9fc46bd9058` |
-| 开池后铸造 1 份（部署者），硬顶 8 份铸满 | `0x773dd2038f4560e0899bf99cff7c0c330ae5cb953a414e3b9503f768afcab03a` |
-| 退款：mint(1) | `0xff1b8fe5b68bddccd7223b0f7a299bd2a0d9b7ec802f7fb971d569542ee59461` |
-| 退款：triggerRefund | `0xf408e54745f1396faf4d1c46ad246cbebddb04ec8e9b54279fb90a6c12d6cf3f` |
-| 退款：refund | `0xec113a768c117c687244e6bc230cb6daed188734a5c6d49f2f8f9ccc68a7e90b` |
+| Post-open mint, 1 share (agent2, right after poke/transfer/trade activity), 1% overpayment refunded | `0x08483ea3bb655860e738e30b8ce5d340ebc97967160b1e2710c09d12ba032fec` |
+| Post-open mint, 2 shares (agent2) | `0xbafcc2207e2bed13f7c582bb9c4aff2f01e47e5b0d2dbe59667ca9fc46bd9058` |
+| Post-open mint, 1 share (deployer), hard cap of 8 shares filled | `0x773dd2038f4560e0899bf99cff7c0c330ae5cb953a414e3b9503f768afcab03a` |
+| Refund run: mint(1) | `0xff1b8fe5b68bddccd7223b0f7a299bd2a0d9b7ec802f7fb971d569542ee59461` |
+| Refund run: triggerRefund | `0xf408e54745f1396faf4d1c46ad246cbebddb04ec8e9b54279fb90a6c12d6cf3f` |
+| Refund run: refund | `0xec113a768c117c687244e6bc230cb6daed188734a5c6d49f2f8f9ccc68a7e90b` |
 
-开池后约 45 分钟里，每 5–7 秒有一笔 poke、转账或小额买卖（共约 345 笔，全部成功），期间 `quoteOpen` 一直可用，三次开池后铸造全部成功；每次多付的部分按 `OpenMinted.paid` 精确退回（如第一笔：发送 1,081,507,876,571,940 wei，扣 1,070,826,660,330,000，退 10,681,216,241,940）。少付的模拟调用回退 `WrongPayment`。铸造前后代币合约的 BNB 余额不变。
+For about 45 minutes after pool opening, a poke, transfer or small trade was sent every 5–7 seconds (about 345 transactions, all successful). `quoteOpen` stayed usable throughout and all three post-open mints succeeded; each overpayment was refunded exactly per `OpenMinted.paid` (e.g. the first one: sent 1,081,507,876,571,940 wei, charged 1,070,826,660,330,000, refunded 10,681,216,241,940). A simulated underpaying call reverted with `WrongPayment`. The token contract's BNB balance was unchanged before and after the mints.
 
-冒烟中还看到一次 `TwapDeviation`：活动脚本前 30 分钟每 4 笔就买 0.00002 tBNB，而池子只有约 0.0004 tBNB，现价被推到 TWAP 的 2 倍，现价护栏按设计拒绝了铸造。之后改成买卖相抵的活动并卖回一次让现价回到 TWAP 附近，铸造随即成功。价格单边快速变动（30 分钟内超过 `twapMaxDeviationBps`）时，开池后铸造会被护栏暂时拒绝，这是有意的取舍。
+One `TwapDeviation` was also observed during the smoke test: for the first 30 minutes the activity script bought 0.00002 tBNB on every 4th transaction while the pool held only about 0.0004 tBNB, pushing the spot price to 2× the TWAP, and the spot guard rejected the mint as designed. After switching to balanced buy/sell activity and one sell-back to bring the spot price near the TWAP, minting succeeded. When the price moves quickly in one direction (more than `twapMaxDeviationBps` within 30 minutes), post-open minting is temporarily rejected by the guard; this is an intentional trade-off.
 
-已修复（2026-11-02）：旧版 `mint` 先观测再读 TWAP，频繁转账会把参考点刷得太新，导致长时间 `TwapNotReady`（旧测试网 05:09 SGT 那次就是这样）；旧版还要求精确付款，报价一变就 `WrongPayment`。现改为检查点环 + 多付退回，见上文「开池之后继续铸造」。
+Fixed (2026-11-02): the old `mint` observed before reading the TWAP, so frequent transfers kept the reference point too recent and caused long `TwapNotReady` periods (as in the old testnet run at 05:09 SGT); the old version also required exact payment, so any quote change caused `WrongPayment`. Now it uses the checkpoint ring plus overpayment refund; see "Minting after pool opening" above.
 
-Sourcify 对以上合约都是 match。BscScan 的验证接口需要 API key，这次没有 key，所以测试网 BscScan 页面上可能仍显示未验证。Sourcify 记录：`https://sourcify.dev/server/v2/contract/97/<address>`。
+All contracts above are a match on Sourcify. BscScan's verification API requires an API key, which was not available this time, so the testnet BscScan pages may still show them as unverified. Sourcify records: `https://sourcify.dev/server/v2/contract/97/<address>`.
 
-更早的测试网部署已弃用。拆分后、修复前：注册表 `0xb5D3EfD26556b93Ac46499294B575944EdFf2090`、验证器 `0x2D676E62aF0EcBE3e7617142A07304a6d04249De`、库 `0xAE5963DBB78fa5fe4b168926A9357F777205bDF0`、代币 `0xcdeB8D208C46f14a825D1d51E9207caDECd79390` / `0xD08D4ecF98B55523Af3cD9016009fD8dc2ff21E6`。拆分前：注册表 `0x0D771114F245508B4B75C764B1112402f0358Eae`、验证器 `0x66454DA1e0C09AABAdbD34BC54D655F44185Fb9F`、代币 `0x9f6d650439b6706dDEE010FaD30D41c7d871247D` / `0xDd2377bd797c8E14704b1c58E6703A86f0525b8D`。
+Earlier testnet deployments are deprecated. After the split, before the fix: registry `0xb5D3EfD26556b93Ac46499294B575944EdFf2090`, verifier `0x2D676E62aF0EcBE3e7617142A07304a6d04249De`, library `0xAE5963DBB78fa5fe4b168926A9357F777205bDF0`, tokens `0xcdeB8D208C46f14a825D1d51E9207caDECd79390` / `0xD08D4ecF98B55523Af3cD9016009fD8dc2ff21E6`. Before the split: registry `0x0D771114F245508B4B75C764B1112402f0358Eae`, verifier `0x66454DA1e0C09AABAdbD34BC54D655F44185Fb9F`, tokens `0x9f6d650439b6706dDEE010FaD30D41c7d871247D` / `0xDd2377bd797c8E14704b1c58E6703A86f0525b8D`.
 
-## 安全自审
+## Security properties (self-review)
 
-| 威胁 | 处理 |
+| Threat | Handling |
 | --- | --- |
-| 抢跑 / 女巫 | 只有 Agent ID 能铸造，且每个钱包和每个 ID 都有上限。ID 本身如果可以批量领取，上限挡不住真人多号。这取决于注册表的发行政策，不在本合约里。 |
-| 闪电贷抬高净买入 | 高水位只在更后的区块提交。同一交易里的买入还没记入高水位，随后的卖出会把它抵消。下一区块提交的是净额，不是中间的峰值。协议自己的换币和加池记成卖出，避免税把解锁灌高。 |
-| 交易对预先灌入 | 开池前本币不可转。WBNB 捐赠若已 `sync`，按捐赠后的余额补代币，使价格仍等于目标；未 `sync` 的捐赠 `skim` 到黑洞。不使用 `addLiquidity`，所以「储备被弄脏导致路由回退」这条路不存在。捐赠极大、乘积溢出 `uint256` 时开池会回退；这需要超出实际存在的 WBNB 数量，不作为可操作的攻击来写进流程。 |
-| 换币重入 | `inSwap` 期间只有本合约自己的转账能通过，其他转账直接回退，所以开发者地址的 `receive` 不能趁换币把一笔卖单做成免税。用户卖单外面还有 `try/catch`。`refund` 先改账再转 BNB，并有重入锁。 |
-| 取整 | 全部向下取整。罚没按 512 位乘除累加，欠下的 wei 立刻从锁定里划走，不能靠把一笔卖单拆成粉尘来逃。分给别人时按 `minUnit` 批量，分不完的在窗口结束时烧掉。单独一个持有人的罚没烧掉，避免「罚了又按比例退回给自己」。 |
-| 7702 | 仅放行 23 字节且前缀为 `0xef0100` 的代码。一个故意做成这 23 字节的合约也能过，这是规范选择的残余风险，过关之后它也没有额外权限。 |
-| 转账扣费与路由 | 卖出必须用 `swapExactTokensForETHSupportingFeeOnTransferTokens`。买入用普通 `swapExactETHForTokens` 即可，因为税是在币离开交易对之后扣的。已在本地迷你路由和主网分叉的真实路由上跑通。 |
-| Agent 钱包兼容性 | 见上一节。当前样例是外部账户。非 7702 的合约钱包不能铸造。注册表管理员可以发 ID，这是外部信任，不是本合约的后门。 |
+| Front-running / Sybil | Only Agent IDs can mint, with limits per wallet and per ID. If IDs themselves can be obtained in bulk, the limits cannot stop one person with many accounts. That depends on the registry's issuance policy, not on this contract. |
+| Flash loans inflating net buys | The high-water mark is committed only in a later block. Buys within the same transaction are not yet in the high-water mark, and a following sell offsets them. The next block commits the net amount, not the intermediate peak. The protocol's own swaps and liquidity adds are recorded as sells, so tax does not inflate unlocks. |
+| Pre-seeding the pair | The token cannot be transferred before pool opening. If a WBNB donation has been `sync`ed, tokens are topped up against the post-donation balance so the price still equals the target; unsynced donations are `skim`med to the burn address. `addLiquidity` is not used, so the "dirty reserves make the router revert" path does not exist. With an extremely large donation whose product overflows `uint256`, pool opening reverts; this requires more WBNB than actually exists and is not treated as an actionable attack. |
+| Swap reentrancy | During `inSwap`, only the contract's own transfers go through and all others revert, so the developer address's `receive` cannot use the swap to turn a sell into a tax-free one. User sells are also wrapped in `try/catch`. `refund` updates accounting before sending BNB and holds a reentrancy lock. |
+| Rounding | Everything rounds down. Forfeiture accumulates with 512-bit mul-div; any wei owed is immediately removed from the locked balance, so splitting a sell into dust cannot escape it. Distribution to others is batched by `minUnit`, and anything undistributable is burned at the end of the window. Forfeiture by a sole holder is burned, to avoid "forfeit and then get it back pro rata". |
+| 7702 | Only 23-byte code with the `0xef0100` prefix passes. A contract deliberately shaped as those 23 bytes would also pass; this is a residual risk of the spec's choice, and passing grants it no extra privileges. |
+| Fee-on-transfer and the router | Sells must use `swapExactTokensForETHSupportingFeeOnTransferTokens`. Buys can use plain `swapExactETHForTokens`, because the tax is taken after tokens leave the pair. Tested on a local mini router and on the real router on a mainnet fork. |
+| Agent wallet compatibility | See the previous section. Current samples are externally owned accounts. Non-7702 contract wallets cannot mint. The registry admin can issue IDs; that is external trust, not a backdoor in this contract. |
 
-Slither 处理：
+Slither findings:
 
-- `arbitrary-send-eth`：`addLiquidityETH` 把刚换到的 BNB 交给不可变路由，LP 接收方是黑洞常量。不是把募集款打给任意地址。
-- `incorrect-exp`：`FullMath` 里的 `^` 是牛顿迭代用的异或，不是指数。误报。
-- `reentrancy-eth`（`finalize`）：账本和 `launched` 在外部调用之前写好，函数持有重入锁。`inFinalize` 在调用期间为真，结束后才清掉。
-- `reentrancy-no-eth`（换币）：用 `inSwap` 把非本合约转账直接回退，储备只在外层调用成功之后清零。
-- `divide-before-multiply` / `incorrect-equality`：有意的向下取整，以及「费率为 0 / 进度为 100%」的精确哨兵。
-- `timestamp`：窗口、解锁和罚没本来就按时间。信息级。
-- 汇编：`extcodesize` 与 `mulDiv`。信息级。
+- `arbitrary-send-eth`: `addLiquidityETH` sends freshly swapped BNB to the immutable router, and the LP recipient is the burn-address constant. Raised funds are not sent to an arbitrary address.
+- `incorrect-exp`: the `^` in `FullMath` is XOR used in the Newton iteration, not exponentiation. False positive.
+- `reentrancy-eth` (`finalize`): accounting and `launched` are written before external calls, and the function holds a reentrancy lock. `inFinalize` is true during the call and cleared only afterwards.
+- `reentrancy-no-eth` (swap): `inSwap` makes non-contract transfers revert, and the reserve is zeroed only after the outer call succeeds.
+- `divide-before-multiply` / `incorrect-equality`: intentional rounding down, and exact sentinels for "rate is 0 / progress is 100%".
+- `timestamp`: windows, unlocks and forfeiture are time-based by design. Informational.
+- Assembly: `extcodesize` and `mulDiv`. Informational.
 
-已知但不在本合约里修的事：开发者地址如果填错，1.5% 会永远打错地方；没有暂停，所以发现实现错误时不能链上冻结；换币可以被夹；黑洞里的 LP 谁也拿不回来，这是设计。
+Known and not fixed in this contract: if the developer address is wrong, the 1.5% goes to the wrong place forever; there is no pause, so an implementation bug cannot be frozen on chain; swaps can be sandwiched; LP in the burn address cannot be recovered by anyone, by design.
 
-## 上主网之前还要人做的事
+## Before mainnet
 
-1. 另找人或审计再读一遍 `src/FairToken.sol`。本文件的自审不是审计。
-2. 选定开发者地址（建议外部账户）。写进构造参数后不能改。
-3. 再确认 Agent ID 注册表仍是 `0x60B9…022F`，路由 / 工厂 / WBNB 仍是上面三个地址。
-4. 用本仓库源码做精确验证。不要用一份「看起来一样」的网页抄本。
-5. 部署必须由人在链下完成。本仓库的脚本拒绝链 ID 56 的广播。不要为了图方便把这个回退删掉再把私钥交给自动化。
-6. 测试网这次没有部署：水龙头要人机验证。
+1. Have someone else or an auditor review `src/FairToken.sol` again. The self-review in this file is not an audit.
+2. Choose the developer address (an externally owned account is recommended). It cannot be changed once written into the constructor arguments.
+3. Reconfirm that the Agent ID registry is still `0x60B9…022F` and that the router / factory / WBNB are still the three addresses above.
+4. Verify with exact source from this repository, not a web copy that "looks the same".
+5. Deployment must be done by a person, off-chain. The generic script refuses to broadcast on chain ID 56. Do not remove that revert to hand a private key to automation for convenience.
+6. Mainnet deployment steps are in [DEPLOY_MAINNET.md](DEPLOY_MAINNET.md).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
