@@ -2,7 +2,15 @@
 
 [English](README.md) | 中文
 
-**未经审计。没有部署在 BSC 主网。** 这是公开的源代码，不是已上线的代币，也不是对价格或结果的承诺。任何人在主网使用之前都需要自己再审计。
+**未经审计。已于 2026-11-02 部署在 BSC 主网（chain id 56）。** 没有第三方审计。本文不对价格或结果做任何承诺。
+
+- FairToken（THAW）：`0x8b7507c891dd2aD1F62Fc2A5ff1a045Ed4BeC47b`
+- AgentIdVerifier：`0x1E0cb11835F2d12Cd52F501a32E13372592DcBBe`
+- FairTokenExt（扩展合约）：`0xB17f067539ea6B4A9b631C8278CF5602B0538Ab5`
+- FairTokenParams（库）：`0x2DeF7c6f02BA9166BA74dA6853afCEbC58E8a12c`
+- 铸造期：2026-11-02 14:36:51 UTC 至 2026-11-05 14:36:51 UTC（deadline `1793889411`）
+
+源码已在 Sourcify 验证（https://repo.sourcify.dev/56/0x8b7507c891dd2aD1F62Fc2A5ff1a045Ed4BeC47b）。
 
 没有管理员的公平铸造代币。铸造期按档位计价，达标后任何人都可以开池，流动性代币打进黑洞。没有团队预留、没有暂停、没有黑名单、没有升级。开池时按写死的比例把募集 BNB 的一成分给开发者地址，其余进流动池；没有人能改这个比例，也没有人能把其余的 BNB 提走。
 

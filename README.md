@@ -2,7 +2,15 @@
 
 English | [中文](README.zh-CN.md)
 
-**Unaudited. Not deployed on BSC mainnet.** This repository is source code only. It is not a live token and it makes no promise about price or outcome. Audit it before any mainnet use.
+**Unaudited. Deployed on BSC mainnet (chain id 56) on 2026-11-02.** No third-party audit has been done. This README makes no promise about price or outcome.
+
+- FairToken (THAW): `0x8b7507c891dd2aD1F62Fc2A5ff1a045Ed4BeC47b`
+- AgentIdVerifier: `0x1E0cb11835F2d12Cd52F501a32E13372592DcBBe`
+- FairTokenExt (extension): `0xB17f067539ea6B4A9b631C8278CF5602B0538Ab5`
+- FairTokenParams (library): `0x2DeF7c6f02BA9166BA74dA6853afCEbC58E8a12c`
+- Mint window: 2026-11-02 14:36:51 UTC to 2026-11-05 14:36:51 UTC (deadline `1793889411`)
+
+Source verified on Sourcify (https://repo.sourcify.dev/56/0x8b7507c891dd2aD1F62Fc2A5ff1a045Ed4BeC47b).
 
 THAW is an ownerless fair-mint ERC-20 on BNB Smart Chain that only addresses holding an Agent ID can mint. The mint is priced in tiers. Once the targets are met, anyone can open the pool, and the LP tokens are sent to a burn address. There is no reserved allocation, no pause, no blacklist and no upgrade path. At pool opening, a hard-coded share (10%) of the raised BNB goes to the developer address and the rest goes into the liquidity pool. Nobody can change that share, and nobody can withdraw the remaining BNB.
 
